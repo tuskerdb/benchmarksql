@@ -34,3 +34,26 @@ osCollectorScript=./misc/os_collector_linux.py
 osCollectorInterval=1
 //osCollectorSSHAddr=user@dbhost
 osCollectorDevices=net_eth0 blk_sda
+
+// ----
+// Consistency check (long-stability test mode).
+//
+// When enabled, a dedicated checker thread periodically runs the TPC-C
+// Clause 3.3 consistency conditions against the live database using an
+// independent read-only transaction (snapshot mode). This is intended
+// for long-stability testing — it does NOT produce a TPC-C-compliant
+// performance number. Only PostgreSQL is supported in the current
+// version.
+//
+// consistencyCheckIntervalSec  seconds between checks; 0 = run only at
+//                              start and end of the run
+// consistencyCheckConditions   "all" or comma-separated condition IDs
+//                              from Clause 3.3 (1..12)
+// consistencyCheckIsolation    REPEATABLE_READ | SERIALIZABLE
+// consistencyCheckAbortOnFail  true = stop the run on first violation
+// ----
+//consistencyCheck=true
+//consistencyCheckIntervalSec=60
+//consistencyCheckConditions=all
+//consistencyCheckIsolation=REPEATABLE_READ
+//consistencyCheckAbortOnFail=true

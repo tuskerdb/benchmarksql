@@ -113,6 +113,21 @@ public class jTPCC implements jTPCCConfig
 	String	osCollectorScript   = getProp(ini, "osCollectorScript");
 
 	log.info("Term-00, ");
+	String  iConsistencyCheck   = ini.getProperty("consistencyCheck");
+	String  iCCIntervalSec      = null;
+	String  iCCConditions       = null;
+	String  iCCIsolation        = null;
+	String  iCCAbortOnFail      = null;
+	if (iConsistencyCheck != null && iConsistencyCheck.equalsIgnoreCase("true"))
+	{
+	    log.info("Term-00, consistencyCheck=" + iConsistencyCheck);
+	    iCCIntervalSec  = getProp(ini, "consistencyCheckIntervalSec");
+	    iCCConditions   = getProp(ini, "consistencyCheckConditions");
+	    iCCIsolation    = getProp(ini, "consistencyCheckIsolation");
+	    iCCAbortOnFail  = getProp(ini, "consistencyCheckAbortOnFail");
+	}
+
+	log.info("Term-00, ");
 
 	if (iDB.equals("firebird"))
 	    dbType = DB_FIREBIRD;
