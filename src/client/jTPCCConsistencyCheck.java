@@ -208,6 +208,9 @@ public class jTPCCConsistencyCheck implements Runnable
 	    case 5: return checkCondition5();
 	    case 6: return checkCondition6();
 	    case 7: return checkCondition7();
+	    case 8: return checkCondition8();
+	    case 9: return checkCondition9();
+	    case 10: return checkCondition10();
 	    default:
 		throw new IllegalStateException(
 		    "condition " + conditionID + " not implemented " +
@@ -511,10 +514,147 @@ public class jTPCCConsistencyCheck implements Runnable
 	}
     }
 
+    /*
+     * Clause 3.3.2.8: for each warehouse,
+     *     W_YTD = sum(H_AMOUNT) over HISTORY rows with H_W_ID = W_ID.
+     *
+     * Full scan of HISTORY — expensive on long runs.
+     */
+    private CheckResult checkCondition8() throws SQLException
+    {
+	String sql =
+	    "SELECT w.w_id, w.w_ytd, h.sum_h_amount " +
+	    "  FROM bmsql_warehouse w " +
+	    "  JOIN (SELECT h_w_id, SUM(h_amount) AS sum_h_amount " +
+	    "          FROM bmsql_history " +
+	    "         GROUP BY h_w_id) h " +
+	    "    ON w.w_id = h.h_w_id " +
+	    " WHERE w.w_ytd <> h.sum_h_amount " +
+	    " LIMIT 1";
+	Statement st = conn.createStatement();
+	try
+	{
+	    ResultSet rs = st.executeQuery(sql);
+	    if (rs.next())
+	    {
+		String key = "w_id=" + rs.getInt(1);
+		String detail = "w_ytd=" + rs.getBigDecimal(2) +
+				", sum(h_amount)=" + rs.getBigDecimal(3);
+		return new CheckResult(false, key, detail);
+	    }
+	    return new CheckResult(true, "", "");
+	}
+	finally
+	{
+	    try { st.close(); } catch (SQLException e) { /* ignore */ }
+	}
+    }
+
+    /*
+     * Clause 3.3.2.9: for each district,
+     *     D_YTD = sum(H_AMOUNT) over HISTORY rows with
+     *     (H_W_ID, H_D_ID) = (D_W_ID, D_ID).
+     */
+    private CheckResult checkCondition9() throws SQLException
+    {
+	String sql =
+	    "SELECT d.d_w_id, d.d_id, d.d_ytd, h.sum_h_amount " +
+	    "  FROM bmsql_district d " +
+	    "  JOIN (SELECT h_w_id, h_d_id, SUM(h_amount) AS sum_h_amount " +
+	    "          FROM bmsql_history " +
+	    "         GROUP BY h_w_id, h_d_id) h " +
+	    "    ON d.d_w_id = h.h_w_id AND d.d_id = h.h_d_id " +
+	    " WHERE d.d_ytd <> h.sum_h_amount " +
+	    " LIMIT 1";
+	Statement st = conn.createStatement();
+	try
+	{
+	    ResultSet rs = st.executeQuery(sql);
+	    if (rs.next())
+	    {
+		String key = "d_w_id=" + rs.getInt(1) +
+			     ", d_id=" + rs.getInt(2);
+		String detail = "d_ytd=" + rs.getBigDecimal(3) +
+				", sum(h_amount)=" + rs.getBigDecimal(4);
+		return new CheckResult(false, key, detail);
+	    }
+	    return new CheckResult(true, "", "");
+	}
+	finally
+	{
+	    try { st.close(); } catch (SQLException e) { /* ignore */ }
+	}
+    }
+
+    /*
+     * Clause 3.3.2.10: for each customer,
+     *     C_BALANCE = sum(OL_AMOUNT) for delivered order lines of the
+     *                 customer   -   sum(H_AMOUNT) for payments of the
+     *                                customer.
+     *
+     * OL_AMOUNT aggregation must join ORDER_LINE to OORDER to recover
+     * the O_C_ID — order lines don't carry the customer id directly.
+     * HISTORY rows identify the paying customer via H_C_W_ID /
+     * H_C_D_ID / H_C_ID. Customers with no delivered lines and no
+     * history rows are handled with COALESCE(..., 0).
+     *
+     * Most expensive check in v1 (two full aggregates joined against
+     * CUSTOMER).
+     */
+    private CheckResult checkCondition10() throws SQLException
+    {
+	String sql =
+	    "SELECT c.c_w_id, c.c_d_id, c.c_id, c.c_balance, " +
+	    "       COALESCE(ol_agg.sum_ol, 0) AS sum_delivered, " +
+	    "       COALESCE(h_agg.sum_h,  0) AS sum_paid " +
+	    "  FROM bmsql_customer c " +
+	    "  LEFT JOIN (SELECT o.o_w_id, o.o_d_id, o.o_c_id, " +
+	    "                    SUM(ol.ol_amount) AS sum_ol " +
+	    "               FROM bmsql_order_line ol " +
+	    "               JOIN bmsql_oorder o " +
+	    "                 ON ol.ol_w_id = o.o_w_id " +
+	    "                AND ol.ol_d_id = o.o_d_id " +
+	    "                AND ol.ol_o_id = o.o_id " +
+	    "              WHERE ol.ol_delivery_d IS NOT NULL " +
+	    "              GROUP BY o.o_w_id, o.o_d_id, o.o_c_id) ol_agg " +
+	    "    ON c.c_w_id = ol_agg.o_w_id " +
+	    "   AND c.c_d_id = ol_agg.o_d_id " +
+	    "   AND c.c_id   = ol_agg.o_c_id " +
+	    "  LEFT JOIN (SELECT h_c_w_id, h_c_d_id, h_c_id, " +
+	    "                    SUM(h_amount) AS sum_h " +
+	    "               FROM bmsql_history " +
+	    "              GROUP BY h_c_w_id, h_c_d_id, h_c_id) h_agg " +
+	    "    ON c.c_w_id = h_agg.h_c_w_id " +
+	    "   AND c.c_d_id = h_agg.h_c_d_id " +
+	    "   AND c.c_id   = h_agg.h_c_id " +
+	    " WHERE c.c_balance <> " +
+	    "       (COALESCE(ol_agg.sum_ol, 0) - COALESCE(h_agg.sum_h, 0)) " +
+	    " LIMIT 1";
+	Statement st = conn.createStatement();
+	try
+	{
+	    ResultSet rs = st.executeQuery(sql);
+	    if (rs.next())
+	    {
+		String key = "w_id=" + rs.getInt(1) +
+			     ", d_id=" + rs.getInt(2) +
+			     ", c_id=" + rs.getInt(3);
+		String detail = "c_balance=" + rs.getBigDecimal(4) +
+				", sum(delivered ol_amount)=" + rs.getBigDecimal(5) +
+				", sum(h_amount)=" + rs.getBigDecimal(6);
+		return new CheckResult(false, key, detail);
+	    }
+	    return new CheckResult(true, "", "");
+	}
+	finally
+	{
+	    try { st.close(); } catch (SQLException e) { /* ignore */ }
+	}
+    }
+
     private static boolean isImplemented(int conditionID)
     {
-	// Extend in the next commit when Tier 3 lands.
-	return conditionID >= 1 && conditionID <= 7;
+	return conditionID >= 1 && conditionID <= 10;
     }
 
     private void writeCsvRow(int checkID, long tsMs, int conditionID,
