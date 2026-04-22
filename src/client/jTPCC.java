@@ -46,6 +46,7 @@ public class jTPCC implements jTPCCConfig
     private double tpmC;
     private jTPCCRandom rnd;
     private OSCollector osCollector = null;
+    private jTPCCConsistencyCheck consistencyCheck = null;
 
     public static void main(String args[])
     {
@@ -164,6 +165,7 @@ public class jTPCC implements jTPCCConfig
 	    databaseDriverLoaded = false;
 	}
 
+	File resultDataDir = null;
 	if (databaseDriverLoaded && resultDirectory != null)
 	{
 	    StringBuffer        sb = new StringBuffer();
@@ -196,7 +198,7 @@ public class jTPCC implements jTPCCConfig
 	    }
 	    resultDirName = sb.toString();
 	    File resultDir = new File(resultDirName);
-	    File resultDataDir = new File(resultDir, "data");
+	    resultDataDir = new File(resultDir, "data");
 
 	    // Create the output directory structure.
 	    if (!resultDir.mkdir())
@@ -562,6 +564,49 @@ public class jTPCC implements jTPCCConfig
 		    }
 
 		    printMessage("All terminals started executing " + sessionStart);
+
+		    // Start the consistency checker if enabled.
+		    if (iConsistencyCheck != null &&
+			iConsistencyCheck.equalsIgnoreCase("true"))
+		    {
+			if (dbType != DB_POSTGRES)
+			{
+			    errorMessage("consistencyCheck is currently only supported for db=postgres");
+			    throw new Exception();
+			}
+			if (resultDataDir == null)
+			{
+			    errorMessage("consistencyCheck requires resultDirectory to be set");
+			    throw new Exception();
+			}
+
+			int ccInterval;
+			java.util.List<Integer> ccConditions;
+			int ccIsolation;
+			boolean ccAbort;
+			try {
+			    ccInterval   = jTPCCConsistencyCheck.parseIntervalSec(iCCIntervalSec);
+			    ccConditions = jTPCCConsistencyCheck.parseConditions(iCCConditions);
+			    ccIsolation  = jTPCCConsistencyCheck.parseIsolation(iCCIsolation);
+			    ccAbort      = (iCCAbortOnFail == null) ||
+					   iCCAbortOnFail.equalsIgnoreCase("true");
+			} catch (IllegalArgumentException iae) {
+			    errorMessage(iae.getMessage());
+			    throw new Exception();
+			}
+
+			try {
+			    consistencyCheck = new jTPCCConsistencyCheck(
+				this, iConn, dbProps,
+				ccInterval, ccConditions, ccIsolation, ccAbort,
+				runID, resultDataDir);
+			    new Thread(consistencyCheck, "ConsistencyCheck").start();
+			} catch (IOException ioe) {
+			    errorMessage("Failed to start consistency checker: " +
+					 ioe.getMessage());
+			    throw new Exception();
+			}
+		    }
 		}
 
 		catch(Exception e1)
@@ -579,6 +624,12 @@ public class jTPCC implements jTPCCConfig
 	    }
 	}
 	updateStatusLine();
+    }
+
+    public void signalConsistencyCheckFailure(String reason)
+    {
+	errorMessage("Consistency check failed: " + reason);
+	signalTerminalsRequestEnd(false);
     }
 
     private void signalTerminalsRequestEnd(boolean timeTriggered)
@@ -644,6 +695,13 @@ public class jTPCC implements jTPCCConfig
 	    {
 	    	osCollector.stop();
 		osCollector = null;
+	    }
+
+	    // Stop the consistency checker, if it is active.
+	    if (consistencyCheck != null)
+	    {
+		consistencyCheck.requestStop();
+		consistencyCheck = null;
 	    }
 	}
     }
