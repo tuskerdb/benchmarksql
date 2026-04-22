@@ -47,6 +47,7 @@ public class jTPCC implements jTPCCConfig
     private jTPCCRandom rnd;
     private OSCollector osCollector = null;
     private jTPCCConsistencyCheck consistencyCheck = null;
+    private Thread                consistencyCheckThread = null;
 
     public static void main(String args[])
     {
@@ -600,7 +601,9 @@ public class jTPCC implements jTPCCConfig
 				this, iConn, dbProps,
 				ccInterval, ccConditions, ccIsolation, ccAbort,
 				runID, resultDataDir);
-			    new Thread(consistencyCheck, "ConsistencyCheck").start();
+			    consistencyCheckThread =
+				new Thread(consistencyCheck, "ConsistencyCheck");
+			    consistencyCheckThread.start();
 			} catch (IOException ioe) {
 			    errorMessage("Failed to start consistency checker: " +
 					 ioe.getMessage());
@@ -676,7 +679,24 @@ public class jTPCC implements jTPCCConfig
 	    sessionEndTimestamp = System.currentTimeMillis();
 	    sessionEndTargetTime = -1;
 	    printMessage("All terminals finished executing " + sessionEnd);
+
+	    // Stop the consistency checker before the end-of-run report so
+	    // its cumulative stats (including the final cycle) can be folded
+	    // into the summary.
+	    if (consistencyCheck != null)
+	    {
+		consistencyCheck.requestStop();
+		if (consistencyCheckThread != null)
+		{
+		    try { consistencyCheckThread.join(); }
+		    catch (InterruptedException ie)
+		    { Thread.currentThread().interrupt(); }
+		}
+	    }
+
 	    endReport();
+	    consistencyCheck = null;
+	    consistencyCheckThread = null;
 	    terminalsBlockingExit = false;
 	    printMessage("Session finished!");
 
@@ -695,13 +715,6 @@ public class jTPCC implements jTPCCConfig
 	    {
 	    	osCollector.stop();
 		osCollector = null;
-	    }
-
-	    // Stop the consistency checker, if it is active.
-	    if (consistencyCheck != null)
-	    {
-		consistencyCheck.requestStop();
-		consistencyCheck = null;
 	    }
 	}
     }
@@ -761,6 +774,22 @@ public class jTPCC implements jTPCCConfig
 	log.info("Term-00, Session End       = " + sessionEnd);
 	log.info("Term-00, Transaction Count = " + (transactionCount-1));
 
+	if (consistencyCheck != null)
+	{
+	    log.info("Term-00, ");
+	    log.info("Term-00, Consistency Check Summary");
+	    log.info("Term-00,   Cycles run       = " +
+		     consistencyCheck.getTotalCycles());
+	    log.info("Term-00,   Conditions passed= " +
+		     consistencyCheck.getTotalPassed());
+	    log.info("Term-00,   Conditions failed= " +
+		     consistencyCheck.getTotalFailed());
+	    log.info("Term-00,   Conditions skipped=" +
+		     consistencyCheck.getTotalSkipped());
+	    String firstFail = consistencyCheck.getFirstFailureSummary();
+	    if (firstFail != null)
+		log.info("Term-00,   First failure    = " + firstFail);
+	}
     }
 
     private void printMessage(String message)

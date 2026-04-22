@@ -38,6 +38,12 @@ public class jTPCCConsistencyCheck implements Runnable
     private int                     checkCounter = 0;
     private final Set<Integer>      warnedUnimplemented = new HashSet<Integer>();
 
+    // Cumulative stats, published for the end-of-run summary.
+    private volatile int            totalPassed  = 0;
+    private volatile int            totalFailed  = 0;
+    private volatile int            totalSkipped = 0;
+    private volatile String         firstFailureSummary = null;
+
     public jTPCCConsistencyCheck(
             jTPCC parent,
             String dbUrl, Properties dbProps,
@@ -67,6 +73,12 @@ public class jTPCCConsistencyCheck implements Runnable
 	requestStop = true;
     }
 
+    public int getTotalCycles()        { return checkCounter; }
+    public int getTotalPassed()        { return totalPassed; }
+    public int getTotalFailed()        { return totalFailed; }
+    public int getTotalSkipped()       { return totalSkipped; }
+    public String getFirstFailureSummary() { return firstFailureSummary; }
+
     public void run()
     {
 	try
@@ -81,6 +93,10 @@ public class jTPCCConsistencyCheck implements Runnable
 	    log.error("Term-CC, failed to open checker connection: " +
 		      e.getMessage());
 	    closeCsv();
+	    // Silent degradation would turn consistencyCheck=true into a
+	    // no-op; treat startup failure the same as a violation.
+	    parent.signalConsistencyCheckFailure(
+		"checker startup failed: " + e.getMessage());
 	    return;
 	}
 
@@ -167,6 +183,11 @@ public class jTPCCConsistencyCheck implements Runnable
 	    else
 	    {
 		failed++;
+		if (firstFailureSummary == null)
+		    firstFailureSummary =
+			"check #" + localCheckID + ", condition " +
+			conditionID + ", key=" + r.firstOffendingKey +
+			", detail=" + r.detail;
 		log.error("Term-CC, condition " + conditionID +
 			  " FAILED: key=" + r.firstOffendingKey +
 			  " detail=" + r.detail);
@@ -174,6 +195,10 @@ public class jTPCCConsistencyCheck implements Runnable
 		    break;
 	    }
 	}
+
+	totalPassed  += passed;
+	totalFailed  += failed;
+	totalSkipped += skipped;
 
 	try { conn.commit(); }
 	catch (SQLException e)
