@@ -204,6 +204,10 @@ public class jTPCCConsistencyCheck implements Runnable
 	    case 1: return checkCondition1();
 	    case 2: return checkCondition2();
 	    case 3: return checkCondition3();
+	    case 4: return checkCondition4();
+	    case 5: return checkCondition5();
+	    case 6: return checkCondition6();
+	    case 7: return checkCondition7();
 	    default:
 		throw new IllegalStateException(
 		    "condition " + conditionID + " not implemented " +
@@ -339,10 +343,178 @@ public class jTPCCConsistencyCheck implements Runnable
 	}
     }
 
+    /*
+     * Clause 3.3.2.4: for each district,
+     *     sum(O_OL_CNT) over ORDER = count(*) over ORDER_LINE
+     *
+     * Assumes every district has at least one order and one order
+     * line (guaranteed after initial load).
+     */
+    private CheckResult checkCondition4() throws SQLException
+    {
+	String sql =
+	    "SELECT a.w_id, a.d_id, a.sum_ol_cnt, b.count_ol " +
+	    "  FROM (SELECT o_w_id AS w_id, o_d_id AS d_id, " +
+	    "               SUM(o_ol_cnt) AS sum_ol_cnt " +
+	    "          FROM bmsql_oorder " +
+	    "         GROUP BY o_w_id, o_d_id) a " +
+	    "  JOIN (SELECT ol_w_id AS w_id, ol_d_id AS d_id, " +
+	    "               COUNT(*) AS count_ol " +
+	    "          FROM bmsql_order_line " +
+	    "         GROUP BY ol_w_id, ol_d_id) b " +
+	    "    ON a.w_id = b.w_id AND a.d_id = b.d_id " +
+	    " WHERE a.sum_ol_cnt <> b.count_ol " +
+	    " LIMIT 1";
+	Statement st = conn.createStatement();
+	try
+	{
+	    ResultSet rs = st.executeQuery(sql);
+	    if (rs.next())
+	    {
+		String key = "w_id=" + rs.getInt(1) +
+			     ", d_id=" + rs.getInt(2);
+		String detail = "sum(o_ol_cnt)=" + rs.getLong(3) +
+				", count(ol)=" + rs.getLong(4);
+		return new CheckResult(false, key, detail);
+	    }
+	    return new CheckResult(true, "", "");
+	}
+	finally
+	{
+	    try { st.close(); } catch (SQLException e) { /* ignore */ }
+	}
+    }
+
+    /*
+     * Clause 3.3.2.5: for each order,
+     *     O_CARRIER_ID IS NULL  iff  a matching NEW_ORDER row exists
+     *
+     * Violation = XOR of the two predicates. A LEFT JOIN from ORDER
+     * to NEW_ORDER with a match indicator captures both directions.
+     */
+    private CheckResult checkCondition5() throws SQLException
+    {
+	String sql =
+	    "SELECT o.o_w_id, o.o_d_id, o.o_id, " +
+	    "       CASE WHEN o.o_carrier_id IS NULL THEN 1 ELSE 0 END AS carrier_null, " +
+	    "       CASE WHEN no.no_o_id IS NULL THEN 0 ELSE 1 END AS has_new_order " +
+	    "  FROM bmsql_oorder o " +
+	    "  LEFT JOIN bmsql_new_order no " +
+	    "    ON o.o_w_id = no.no_w_id " +
+	    "   AND o.o_d_id = no.no_d_id " +
+	    "   AND o.o_id   = no.no_o_id " +
+	    " WHERE (o.o_carrier_id IS NULL) <> (no.no_o_id IS NOT NULL) " +
+	    " LIMIT 1";
+	Statement st = conn.createStatement();
+	try
+	{
+	    ResultSet rs = st.executeQuery(sql);
+	    if (rs.next())
+	    {
+		String key = "w_id=" + rs.getInt(1) +
+			     ", d_id=" + rs.getInt(2) +
+			     ", o_id=" + rs.getInt(3);
+		String detail = "o_carrier_id_null=" + rs.getInt(4) +
+				", has_new_order=" + rs.getInt(5);
+		return new CheckResult(false, key, detail);
+	    }
+	    return new CheckResult(true, "", "");
+	}
+	finally
+	{
+	    try { st.close(); } catch (SQLException e) { /* ignore */ }
+	}
+    }
+
+    /*
+     * Clause 3.3.2.6: for each order,
+     *     O_OL_CNT = count(ORDER_LINE rows with the same (W,D,O))
+     *
+     * COALESCE handles orders with no matching OL rows (would still
+     * be a violation unless O_OL_CNT is 0, which the spec doesn't
+     * allow). Expensive on large loads — full scan of ORDER and
+     * ORDER_LINE.
+     */
+    private CheckResult checkCondition6() throws SQLException
+    {
+	String sql =
+	    "SELECT o.o_w_id, o.o_d_id, o.o_id, o.o_ol_cnt, " +
+	    "       COALESCE(ol_c.cnt, 0) AS ol_cnt " +
+	    "  FROM bmsql_oorder o " +
+	    "  LEFT JOIN (SELECT ol_w_id, ol_d_id, ol_o_id, " +
+	    "                    COUNT(*) AS cnt " +
+	    "               FROM bmsql_order_line " +
+	    "              GROUP BY ol_w_id, ol_d_id, ol_o_id) ol_c " +
+	    "    ON o.o_w_id = ol_c.ol_w_id " +
+	    "   AND o.o_d_id = ol_c.ol_d_id " +
+	    "   AND o.o_id   = ol_c.ol_o_id " +
+	    " WHERE o.o_ol_cnt <> COALESCE(ol_c.cnt, 0) " +
+	    " LIMIT 1";
+	Statement st = conn.createStatement();
+	try
+	{
+	    ResultSet rs = st.executeQuery(sql);
+	    if (rs.next())
+	    {
+		String key = "w_id=" + rs.getInt(1) +
+			     ", d_id=" + rs.getInt(2) +
+			     ", o_id=" + rs.getInt(3);
+		String detail = "o_ol_cnt=" + rs.getInt(4) +
+				", count(ol)=" + rs.getInt(5);
+		return new CheckResult(false, key, detail);
+	    }
+	    return new CheckResult(true, "", "");
+	}
+	finally
+	{
+	    try { st.close(); } catch (SQLException e) { /* ignore */ }
+	}
+    }
+
+    /*
+     * Clause 3.3.2.7: for each order line,
+     *     OL_DELIVERY_D IS NULL  iff  O_CARRIER_ID IS NULL
+     * on the parent order.
+     */
+    private CheckResult checkCondition7() throws SQLException
+    {
+	String sql =
+	    "SELECT ol.ol_w_id, ol.ol_d_id, ol.ol_o_id, ol.ol_number, " +
+	    "       CASE WHEN ol.ol_delivery_d IS NULL THEN 1 ELSE 0 END AS ol_null, " +
+	    "       CASE WHEN o.o_carrier_id IS NULL THEN 1 ELSE 0 END AS carrier_null " +
+	    "  FROM bmsql_order_line ol " +
+	    "  JOIN bmsql_oorder o " +
+	    "    ON ol.ol_w_id = o.o_w_id " +
+	    "   AND ol.ol_d_id = o.o_d_id " +
+	    "   AND ol.ol_o_id = o.o_id " +
+	    " WHERE (ol.ol_delivery_d IS NULL) <> (o.o_carrier_id IS NULL) " +
+	    " LIMIT 1";
+	Statement st = conn.createStatement();
+	try
+	{
+	    ResultSet rs = st.executeQuery(sql);
+	    if (rs.next())
+	    {
+		String key = "w_id=" + rs.getInt(1) +
+			     ", d_id=" + rs.getInt(2) +
+			     ", o_id=" + rs.getInt(3) +
+			     ", ol_number=" + rs.getInt(4);
+		String detail = "ol_delivery_d_null=" + rs.getInt(5) +
+				", o_carrier_id_null=" + rs.getInt(6);
+		return new CheckResult(false, key, detail);
+	    }
+	    return new CheckResult(true, "", "");
+	}
+	finally
+	{
+	    try { st.close(); } catch (SQLException e) { /* ignore */ }
+	}
+    }
+
     private static boolean isImplemented(int conditionID)
     {
-	// Extend in subsequent commits as Tier 2 / 3 land.
-	return conditionID >= 1 && conditionID <= 3;
+	// Extend in the next commit when Tier 3 lands.
+	return conditionID >= 1 && conditionID <= 7;
     }
 
     private void writeCsvRow(int checkID, long tsMs, int conditionID,
