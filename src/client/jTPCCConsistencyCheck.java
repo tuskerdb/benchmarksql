@@ -202,6 +202,8 @@ public class jTPCCConsistencyCheck implements Runnable
 	switch (conditionID)
 	{
 	    case 1: return checkCondition1();
+	    case 2: return checkCondition2();
+	    case 3: return checkCondition3();
 	    default:
 		throw new IllegalStateException(
 		    "condition " + conditionID + " not implemented " +
@@ -243,10 +245,104 @@ public class jTPCCConsistencyCheck implements Runnable
 	}
     }
 
+    /*
+     * Clause 3.3.2.2: for each district,
+     *     D_NEXT_O_ID - 1 = max(O_ID) = max(NO_O_ID)
+     *
+     * max(NO_O_ID) is allowed to be NULL (all pending new orders
+     * delivered); in that case only the ORDER-side equality is
+     * enforced. max(O_ID) NULL is treated as a violation since every
+     * district has orders from initial load onward.
+     */
+    private CheckResult checkCondition2() throws SQLException
+    {
+	String sql =
+	    "SELECT d.d_w_id, d.d_id, d.d_next_o_id, " +
+	    "       o_agg.max_o_id, no_agg.max_no_o_id " +
+	    "  FROM bmsql_district d " +
+	    "  LEFT JOIN (SELECT o_w_id, o_d_id, MAX(o_id) AS max_o_id " +
+	    "               FROM bmsql_oorder " +
+	    "              GROUP BY o_w_id, o_d_id) o_agg " +
+	    "    ON d.d_w_id = o_agg.o_w_id AND d.d_id = o_agg.o_d_id " +
+	    "  LEFT JOIN (SELECT no_w_id, no_d_id, MAX(no_o_id) AS max_no_o_id " +
+	    "               FROM bmsql_new_order " +
+	    "              GROUP BY no_w_id, no_d_id) no_agg " +
+	    "    ON d.d_w_id = no_agg.no_w_id AND d.d_id = no_agg.no_d_id " +
+	    " WHERE o_agg.max_o_id IS NULL " +
+	    "    OR (d.d_next_o_id - 1) <> o_agg.max_o_id " +
+	    "    OR (no_agg.max_no_o_id IS NOT NULL " +
+	    "        AND (d.d_next_o_id - 1) <> no_agg.max_no_o_id) " +
+	    " LIMIT 1";
+	Statement st = conn.createStatement();
+	try
+	{
+	    ResultSet rs = st.executeQuery(sql);
+	    if (rs.next())
+	    {
+		String key = "d_w_id=" + rs.getInt(1) +
+			     ", d_id=" + rs.getInt(2);
+		int dNext = rs.getInt(3);
+		int maxO = rs.getInt(4);
+		boolean maxONull = rs.wasNull();
+		int maxNO = rs.getInt(5);
+		boolean maxNONull = rs.wasNull();
+		String detail = "d_next_o_id=" + dNext +
+				", max(o_id)=" + (maxONull ? "NULL" : maxO) +
+				", max(no_o_id)=" + (maxNONull ? "NULL" : maxNO);
+		return new CheckResult(false, key, detail);
+	    }
+	    return new CheckResult(true, "", "");
+	}
+	finally
+	{
+	    try { st.close(); } catch (SQLException e) { /* ignore */ }
+	}
+    }
+
+    /*
+     * Clause 3.3.2.3: for each district, the set of NO_O_ID values
+     * in NEW_ORDER must be contiguous:
+     *     max(NO_O_ID) - min(NO_O_ID) + 1 = count(*)
+     *
+     * Districts with zero pending new orders don't appear in the
+     * grouped result and are implicitly OK.
+     */
+    private CheckResult checkCondition3() throws SQLException
+    {
+	String sql =
+	    "SELECT no_w_id, no_d_id, " +
+	    "       MIN(no_o_id) AS min_o, " +
+	    "       MAX(no_o_id) AS max_o, " +
+	    "       COUNT(*)     AS cnt " +
+	    "  FROM bmsql_new_order " +
+	    " GROUP BY no_w_id, no_d_id " +
+	    "HAVING MAX(no_o_id) - MIN(no_o_id) + 1 <> COUNT(*) " +
+	    " LIMIT 1";
+	Statement st = conn.createStatement();
+	try
+	{
+	    ResultSet rs = st.executeQuery(sql);
+	    if (rs.next())
+	    {
+		String key = "no_w_id=" + rs.getInt(1) +
+			     ", no_d_id=" + rs.getInt(2);
+		String detail = "min=" + rs.getInt(3) +
+				", max=" + rs.getInt(4) +
+				", count=" + rs.getInt(5);
+		return new CheckResult(false, key, detail);
+	    }
+	    return new CheckResult(true, "", "");
+	}
+	finally
+	{
+	    try { st.close(); } catch (SQLException e) { /* ignore */ }
+	}
+    }
+
     private static boolean isImplemented(int conditionID)
     {
-	// Extend in subsequent commits as Tier 1 / 2 / 3 land.
-	return conditionID == 1;
+	// Extend in subsequent commits as Tier 2 / 3 land.
+	return conditionID >= 1 && conditionID <= 3;
     }
 
     private void writeCsvRow(int checkID, long tsMs, int conditionID,
