@@ -35,3 +35,6 @@ Thumbs.db
 # Claude Code — personal, not shared
 CLAUDE.local.md
 .claude/
+
+# Local-only design docs / plans / notes (*.local.md convention)
+*.local.md
