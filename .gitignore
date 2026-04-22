@@ -1,0 +1,37 @@
+# Ant build outputs (see build.xml clean target)
+build/
+dist/
+run/logs/
+
+# Java
+*.class
+
+# Python bytecode (run/misc/os_collector_linux.py)
+__pycache__/
+*.pyc
+
+# R (generateReport.sh / run/misc/*.R)
+.Rhistory
+Rplots.pdf
+
+# IDE — IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# IDE — Eclipse
+.project
+.classpath
+.settings/
+
+# IDE — VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code — personal, not shared
+CLAUDE.local.md
+.claude/
