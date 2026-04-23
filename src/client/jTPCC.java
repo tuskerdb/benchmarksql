@@ -600,7 +600,7 @@ public class jTPCC implements jTPCCConfig
 			    consistencyCheck = new jTPCCConsistencyCheck(
 				this, iConn, dbProps,
 				ccInterval, ccConditions, ccIsolation, ccAbort,
-				runID, resultDataDir);
+				runID, resultDataDir, iDB);
 			    consistencyCheckThread =
 				new Thread(consistencyCheck, "ConsistencyCheck");
 			    consistencyCheckThread.start();
@@ -784,8 +784,6 @@ public class jTPCC implements jTPCCConfig
 		     consistencyCheck.getTotalPassed());
 	    log.info("Term-00,   Conditions failed= " +
 		     consistencyCheck.getTotalFailed());
-	    log.info("Term-00,   Conditions skipped=" +
-		     consistencyCheck.getTotalSkipped());
 	    String firstFail = consistencyCheck.getFirstFailureSummary();
 	    if (firstFail != null)
 		log.info("Term-00,   First failure    = " + firstFail);

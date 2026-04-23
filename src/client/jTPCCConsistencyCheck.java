@@ -3,9 +3,17 @@
  *     consistency conditions, for long-stability testing.
  *
  * Runs in a dedicated thread with its own read-only JDBC connection.
- * Snapshot mode only: all enabled conditions execute inside one
- * REPEATABLE READ / SERIALIZABLE transaction per cycle. v1 is
- * PostgreSQL-only.
+ * Snapshot mode only: all configured conditions execute inside one
+ * REPEATABLE READ / SERIALIZABLE transaction per cycle.
+ *
+ * The check queries live in a vendor-aware SQL file:
+ *   sql.<db>/consistencyCheck.sql  (override, optional)
+ *   sql.common/consistencyCheck.sql (fallback)
+ * The file is ;-separated. The Nth statement is condition N. Each
+ * query must return zero rows when the condition holds; any returned
+ * row is a violation, and the row's columns are logged and written to
+ * consistency.csv. Use LIMIT 1 / FETCH FIRST 1 to keep the payload
+ * small.
  */
 
 import org.apache.log4j.*;
@@ -18,11 +26,6 @@ public class jTPCCConsistencyCheck implements Runnable
 {
     private static Logger log = Logger.getLogger(jTPCCConsistencyCheck.class);
 
-    // All Clause 3.3 condition IDs in scope for v1. IDs not yet
-    // implemented are filtered at run time and skipped with a warning.
-    private static final int[] ALL_CONDITIONS =
-        { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-
     private final jTPCC             parent;
     private final String            dbUrl;
     private final Properties        dbProps;
@@ -32,11 +35,11 @@ public class jTPCCConsistencyCheck implements Runnable
     private final boolean           abortOnFail;
     private final int               runID;
     private final BufferedWriter    csv;
+    private final List<String>      sqls;   // index i = condition (i+1)
 
     private Connection              conn;
     private volatile boolean        requestStop = false;
     private int                     checkCounter = 0;
-    private final Set<Integer>      warnedUnimplemented = new HashSet<Integer>();
     // Last SQL issued by a check, so runOneCycle can log it on violation
     // or SQLException. The checker is single-threaded, so no sync needed.
     private String                  lastSql = null;
@@ -44,7 +47,6 @@ public class jTPCCConsistencyCheck implements Runnable
     // Cumulative stats, published for the end-of-run summary.
     private volatile int            totalPassed  = 0;
     private volatile int            totalFailed  = 0;
-    private volatile int            totalSkipped = 0;
     private volatile String         firstFailureSummary = null;
 
     public jTPCCConsistencyCheck(
@@ -52,23 +54,105 @@ public class jTPCCConsistencyCheck implements Runnable
             String dbUrl, Properties dbProps,
             int intervalSec, List<Integer> conditions,
             int isolationLevel, boolean abortOnFail,
-            int runID, File resultDataDir) throws IOException
+            int runID, File resultDataDir,
+            String dbType) throws IOException
     {
 	this.parent = parent;
 	this.dbUrl = dbUrl;
 	this.dbProps = dbProps;
 	this.intervalSec = intervalSec;
-	this.conditions = conditions;
 	this.isolationLevel = isolationLevel;
 	this.abortOnFail = abortOnFail;
 	this.runID = runID;
 
+	this.sqls = loadSqlFile(dbType);
+
+	// Expand "all" (empty list from parseConditions) to every condition
+	// the file supplies, or validate the explicit list against the
+	// file's range.
+	if (conditions.isEmpty())
+	{
+	    List<Integer> all = new ArrayList<Integer>();
+	    for (int i = 1; i <= sqls.size(); i++) all.add(i);
+	    this.conditions = all;
+	}
+	else
+	{
+	    for (int id : conditions)
+	    {
+		if (id < 1 || id > sqls.size())
+		    throw new IOException(
+			"consistencyCheckConditions: id " + id +
+			" out of range 1.." + sqls.size() +
+			" (SQL file supplies " + sqls.size() +
+			" statement(s))");
+	    }
+	    this.conditions = conditions;
+	}
+
 	File f = new File(resultDataDir, "consistency.csv");
 	this.csv = new BufferedWriter(new FileWriter(f));
-	csv.write("run,checkID,tsMs,conditionID,passed,durationMs," +
-		  "firstOffendingKey,detail\n");
+	csv.write("run,checkID,tsMs,conditionID,passed,durationMs,detail\n");
 	csv.flush();
 	log.info("Term-CC, writing consistency results to " + f.getPath());
+    }
+
+    // Resolve sql.<db>/consistencyCheck.sql first, then sql.common/, and
+    // split the content on ';' (with \; as literal-semicolon escape) to
+    // get one SQL per condition in declaration order.
+    private static List<String> loadSqlFile(String dbType) throws IOException
+    {
+	String name = "consistencyCheck.sql";
+	File vendor = new File("sql." + dbType, name);
+	File common = new File("sql.common", name);
+	File target = vendor.isFile() ? vendor : common;
+	if (!target.isFile())
+	    throw new IOException("consistency SQL file not found: tried " +
+				  vendor.getPath() + " and " +
+				  common.getPath());
+
+	StringBuilder buf = new StringBuilder();
+	BufferedReader r = new BufferedReader(new FileReader(target));
+	try
+	{
+	    String line;
+	    while ((line = r.readLine()) != null)
+	    {
+		buf.append(line);
+		buf.append('\n');
+	    }
+	}
+	finally { try { r.close(); } catch (IOException e) { /* ignore */ } }
+
+	List<String> out = new ArrayList<String>();
+	StringBuilder cur = new StringBuilder();
+	int len = buf.length();
+	for (int i = 0; i < len; i++)
+	{
+	    char c = buf.charAt(i);
+	    if (c == '\\' && i + 1 < len && buf.charAt(i + 1) == ';')
+	    {
+		cur.append(';');
+		i++;
+		continue;
+	    }
+	    if (c == ';')
+	    {
+		String s = cur.toString().trim();
+		if (!s.isEmpty()) out.add(s);
+		cur.setLength(0);
+		continue;
+	    }
+	    cur.append(c);
+	}
+	String tail = cur.toString().trim();
+	if (!tail.isEmpty()) out.add(tail);
+	if (out.isEmpty())
+	    throw new IOException("consistency SQL file " +
+				  target.getPath() + " contains no statements");
+	log.info("Term-CC, loaded " + out.size() +
+		 " consistency SQL statement(s) from " + target.getPath());
+	return out;
     }
 
     public void requestStop()
@@ -79,7 +163,6 @@ public class jTPCCConsistencyCheck implements Runnable
     public int getTotalCycles()        { return checkCounter; }
     public int getTotalPassed()        { return totalPassed; }
     public int getTotalFailed()        { return totalFailed; }
-    public int getTotalSkipped()       { return totalSkipped; }
     public String getFirstFailureSummary() { return firstFailureSummary; }
 
     public void run()
@@ -146,19 +229,10 @@ public class jTPCCConsistencyCheck implements Runnable
 	checkCounter++;
 	int localCheckID = checkCounter;
 	long cycleStartMs = System.currentTimeMillis();
-	int passed = 0, failed = 0, skipped = 0;
+	int passed = 0, failed = 0;
 
 	for (int conditionID : conditions)
 	{
-	    if (!isImplemented(conditionID))
-	    {
-		if (warnedUnimplemented.add(conditionID))
-		    log.warn("Term-CC, condition " + conditionID +
-			     " not yet implemented, skipping");
-		skipped++;
-		continue;
-	    }
-
 	    long tsMs = System.currentTimeMillis();
 	    long startNs = System.nanoTime();
 	    CheckResult r;
@@ -168,8 +242,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	    }
 	    catch (SQLException e)
 	    {
-		r = new CheckResult(false, "",
-				    "SQLException: " + e.getMessage());
+		r = new CheckResult(false, "SQLException: " + e.getMessage());
 		log.error("Term-CC, condition " + conditionID +
 			  " errored: " + e.getMessage() +
 			  "\n  SQL: " + lastSql);
@@ -190,20 +263,17 @@ public class jTPCCConsistencyCheck implements Runnable
 		if (firstFailureSummary == null)
 		    firstFailureSummary =
 			"check #" + localCheckID + ", condition " +
-			conditionID + ", key=" + r.firstOffendingKey +
-			", detail=" + r.detail;
+			conditionID + ", " + r.detail;
 		log.error("Term-CC, condition " + conditionID +
-			  " FAILED: key=" + r.firstOffendingKey +
-			  " detail=" + r.detail +
+			  " FAILED: " + r.detail +
 			  "\n  SQL: " + lastSql);
 		if (abortOnFail)
 		    break;
 	    }
 	}
 
-	totalPassed  += passed;
-	totalFailed  += failed;
-	totalSkipped += skipped;
+	totalPassed += passed;
+	totalFailed += failed;
 
 	try { conn.commit(); }
 	catch (SQLException e)
@@ -213,8 +283,8 @@ public class jTPCCConsistencyCheck implements Runnable
 
 	long cycleDurationMs = System.currentTimeMillis() - cycleStartMs;
 	log.info("Term-CC, check #" + localCheckID + ": " +
-		 passed + " passed, " + failed + " failed, " +
-		 skipped + " skipped (" + cycleDurationMs + "ms)");
+		 passed + " passed, " + failed + " failed (" +
+		 cycleDurationMs + "ms)");
 
 	if (failed > 0 && abortOnFail)
 	{
@@ -227,55 +297,21 @@ public class jTPCCConsistencyCheck implements Runnable
 	return false;
     }
 
+    // Execute the SQL for the given condition. If the query returns any
+    // row, format all its columns as "col=val, col=val, ..." (using the
+    // ResultSet metadata) and report a violation. If it returns no row,
+    // the condition holds.
     private CheckResult runCondition(int conditionID) throws SQLException
     {
-	switch (conditionID)
-	{
-	    case 1: return checkCondition1();
-	    case 2: return checkCondition2();
-	    case 3: return checkCondition3();
-	    case 4: return checkCondition4();
-	    case 5: return checkCondition5();
-	    case 6: return checkCondition6();
-	    case 7: return checkCondition7();
-	    case 8: return checkCondition8();
-	    case 9: return checkCondition9();
-	    case 10: return checkCondition10();
-	    default:
-		throw new IllegalStateException(
-		    "condition " + conditionID + " not implemented " +
-		    "(should have been filtered)");
-	}
-    }
-
-    /*
-     * Clause 3.3.2.1: for each warehouse W,
-     *     W_YTD = sum(D_YTD) over its districts.
-     */
-    private CheckResult checkCondition1() throws SQLException
-    {
-	String sql =
-	    "SELECT w.w_id, w.w_ytd, d.sum_d_ytd " +
-	    "  FROM bmsql_warehouse w " +
-	    "  JOIN (SELECT d_w_id, SUM(d_ytd) AS sum_d_ytd " +
-	    "          FROM bmsql_district " +
-	    "         GROUP BY d_w_id) d " +
-	    "    ON w.w_id = d.d_w_id " +
-	    " WHERE w.w_ytd <> d.sum_d_ytd " +
-	    " LIMIT 1";
+	String sql = sqls.get(conditionID - 1);
 	lastSql = sql;
 	Statement st = conn.createStatement();
 	try
 	{
 	    ResultSet rs = st.executeQuery(sql);
 	    if (rs.next())
-	    {
-		String key = "w_id=" + rs.getInt(1);
-		String detail = "w_ytd=" + rs.getBigDecimal(2) +
-				", sum(d_ytd)=" + rs.getBigDecimal(3);
-		return new CheckResult(false, key, detail);
-	    }
-	    return new CheckResult(true, "", "");
+		return new CheckResult(false, formatRow(rs));
+	    return new CheckResult(true, "");
 	}
 	finally
 	{
@@ -283,418 +319,20 @@ public class jTPCCConsistencyCheck implements Runnable
 	}
     }
 
-    /*
-     * Clause 3.3.2.2: for each district,
-     *     D_NEXT_O_ID - 1 = max(O_ID) = max(NO_O_ID)
-     *
-     * max(NO_O_ID) is allowed to be NULL (all pending new orders
-     * delivered); in that case only the ORDER-side equality is
-     * enforced. max(O_ID) NULL is treated as a violation since every
-     * district has orders from initial load onward.
-     */
-    private CheckResult checkCondition2() throws SQLException
+    private static String formatRow(ResultSet rs) throws SQLException
     {
-	String sql =
-	    "SELECT d.d_w_id, d.d_id, d.d_next_o_id, " +
-	    "       o_agg.max_o_id, no_agg.max_no_o_id " +
-	    "  FROM bmsql_district d " +
-	    "  LEFT JOIN (SELECT o_w_id, o_d_id, MAX(o_id) AS max_o_id " +
-	    "               FROM bmsql_oorder " +
-	    "              GROUP BY o_w_id, o_d_id) o_agg " +
-	    "    ON d.d_w_id = o_agg.o_w_id AND d.d_id = o_agg.o_d_id " +
-	    "  LEFT JOIN (SELECT no_w_id, no_d_id, MAX(no_o_id) AS max_no_o_id " +
-	    "               FROM bmsql_new_order " +
-	    "              GROUP BY no_w_id, no_d_id) no_agg " +
-	    "    ON d.d_w_id = no_agg.no_w_id AND d.d_id = no_agg.no_d_id " +
-	    " WHERE o_agg.max_o_id IS NULL " +
-	    "    OR (d.d_next_o_id - 1) <> o_agg.max_o_id " +
-	    "    OR (no_agg.max_no_o_id IS NOT NULL " +
-	    "        AND (d.d_next_o_id - 1) <> no_agg.max_no_o_id) " +
-	    " LIMIT 1";
-	lastSql = sql;
-	Statement st = conn.createStatement();
-	try
+	ResultSetMetaData md = rs.getMetaData();
+	int n = md.getColumnCount();
+	StringBuilder sb = new StringBuilder();
+	for (int i = 1; i <= n; i++)
 	{
-	    ResultSet rs = st.executeQuery(sql);
-	    if (rs.next())
-	    {
-		String key = "d_w_id=" + rs.getInt(1) +
-			     ", d_id=" + rs.getInt(2);
-		int dNext = rs.getInt(3);
-		int maxO = rs.getInt(4);
-		boolean maxONull = rs.wasNull();
-		int maxNO = rs.getInt(5);
-		boolean maxNONull = rs.wasNull();
-		String detail = "d_next_o_id=" + dNext +
-				", max(o_id)=" + (maxONull ? "NULL" : maxO) +
-				", max(no_o_id)=" + (maxNONull ? "NULL" : maxNO);
-		return new CheckResult(false, key, detail);
-	    }
-	    return new CheckResult(true, "", "");
+	    if (i > 1) sb.append(", ");
+	    sb.append(md.getColumnLabel(i));
+	    sb.append('=');
+	    Object v = rs.getObject(i);
+	    sb.append(v == null ? "NULL" : v.toString());
 	}
-	finally
-	{
-	    try { st.close(); } catch (SQLException e) { /* ignore */ }
-	}
-    }
-
-    /*
-     * Clause 3.3.2.3: for each district, the set of NO_O_ID values
-     * in NEW_ORDER must be contiguous:
-     *     max(NO_O_ID) - min(NO_O_ID) + 1 = count(*)
-     *
-     * Districts with zero pending new orders don't appear in the
-     * grouped result and are implicitly OK.
-     */
-    private CheckResult checkCondition3() throws SQLException
-    {
-	String sql =
-	    "SELECT no_w_id, no_d_id, " +
-	    "       MIN(no_o_id) AS min_o, " +
-	    "       MAX(no_o_id) AS max_o, " +
-	    "       COUNT(*)     AS cnt " +
-	    "  FROM bmsql_new_order " +
-	    " GROUP BY no_w_id, no_d_id " +
-	    "HAVING MAX(no_o_id) - MIN(no_o_id) + 1 <> COUNT(*) " +
-	    " LIMIT 1";
-	lastSql = sql;
-	Statement st = conn.createStatement();
-	try
-	{
-	    ResultSet rs = st.executeQuery(sql);
-	    if (rs.next())
-	    {
-		String key = "no_w_id=" + rs.getInt(1) +
-			     ", no_d_id=" + rs.getInt(2);
-		String detail = "min=" + rs.getInt(3) +
-				", max=" + rs.getInt(4) +
-				", count=" + rs.getInt(5);
-		return new CheckResult(false, key, detail);
-	    }
-	    return new CheckResult(true, "", "");
-	}
-	finally
-	{
-	    try { st.close(); } catch (SQLException e) { /* ignore */ }
-	}
-    }
-
-    /*
-     * Clause 3.3.2.4: for each district,
-     *     sum(O_OL_CNT) over ORDER = count(*) over ORDER_LINE
-     *
-     * Assumes every district has at least one order and one order
-     * line (guaranteed after initial load).
-     */
-    private CheckResult checkCondition4() throws SQLException
-    {
-	String sql =
-	    "SELECT a.w_id, a.d_id, a.sum_ol_cnt, b.count_ol " +
-	    "  FROM (SELECT o_w_id AS w_id, o_d_id AS d_id, " +
-	    "               SUM(o_ol_cnt) AS sum_ol_cnt " +
-	    "          FROM bmsql_oorder " +
-	    "         GROUP BY o_w_id, o_d_id) a " +
-	    "  JOIN (SELECT ol_w_id AS w_id, ol_d_id AS d_id, " +
-	    "               COUNT(*) AS count_ol " +
-	    "          FROM bmsql_order_line " +
-	    "         GROUP BY ol_w_id, ol_d_id) b " +
-	    "    ON a.w_id = b.w_id AND a.d_id = b.d_id " +
-	    " WHERE a.sum_ol_cnt <> b.count_ol " +
-	    " LIMIT 1";
-	lastSql = sql;
-	Statement st = conn.createStatement();
-	try
-	{
-	    ResultSet rs = st.executeQuery(sql);
-	    if (rs.next())
-	    {
-		String key = "w_id=" + rs.getInt(1) +
-			     ", d_id=" + rs.getInt(2);
-		String detail = "sum(o_ol_cnt)=" + rs.getLong(3) +
-				", count(ol)=" + rs.getLong(4);
-		return new CheckResult(false, key, detail);
-	    }
-	    return new CheckResult(true, "", "");
-	}
-	finally
-	{
-	    try { st.close(); } catch (SQLException e) { /* ignore */ }
-	}
-    }
-
-    /*
-     * Clause 3.3.2.5: for each order,
-     *     O_CARRIER_ID IS NULL  iff  a matching NEW_ORDER row exists
-     *
-     * Violation = XOR of the two predicates. A LEFT JOIN from ORDER
-     * to NEW_ORDER with a match indicator captures both directions.
-     */
-    private CheckResult checkCondition5() throws SQLException
-    {
-	String sql =
-	    "SELECT o.o_w_id, o.o_d_id, o.o_id, " +
-	    "       CASE WHEN o.o_carrier_id IS NULL THEN 1 ELSE 0 END AS carrier_null, " +
-	    "       CASE WHEN no.no_o_id IS NULL THEN 0 ELSE 1 END AS has_new_order " +
-	    "  FROM bmsql_oorder o " +
-	    "  LEFT JOIN bmsql_new_order no " +
-	    "    ON o.o_w_id = no.no_w_id " +
-	    "   AND o.o_d_id = no.no_d_id " +
-	    "   AND o.o_id   = no.no_o_id " +
-	    " WHERE (o.o_carrier_id IS NULL) <> (no.no_o_id IS NOT NULL) " +
-	    " LIMIT 1";
-	lastSql = sql;
-	Statement st = conn.createStatement();
-	try
-	{
-	    ResultSet rs = st.executeQuery(sql);
-	    if (rs.next())
-	    {
-		String key = "w_id=" + rs.getInt(1) +
-			     ", d_id=" + rs.getInt(2) +
-			     ", o_id=" + rs.getInt(3);
-		String detail = "o_carrier_id_null=" + rs.getInt(4) +
-				", has_new_order=" + rs.getInt(5);
-		return new CheckResult(false, key, detail);
-	    }
-	    return new CheckResult(true, "", "");
-	}
-	finally
-	{
-	    try { st.close(); } catch (SQLException e) { /* ignore */ }
-	}
-    }
-
-    /*
-     * Clause 3.3.2.6: for each order,
-     *     O_OL_CNT = count(ORDER_LINE rows with the same (W,D,O))
-     *
-     * COALESCE handles orders with no matching OL rows (would still
-     * be a violation unless O_OL_CNT is 0, which the spec doesn't
-     * allow). Expensive on large loads — full scan of ORDER and
-     * ORDER_LINE.
-     */
-    private CheckResult checkCondition6() throws SQLException
-    {
-	String sql =
-	    "SELECT o.o_w_id, o.o_d_id, o.o_id, o.o_ol_cnt, " +
-	    "       COALESCE(ol_c.cnt, 0) AS ol_cnt " +
-	    "  FROM bmsql_oorder o " +
-	    "  LEFT JOIN (SELECT ol_w_id, ol_d_id, ol_o_id, " +
-	    "                    COUNT(*) AS cnt " +
-	    "               FROM bmsql_order_line " +
-	    "              GROUP BY ol_w_id, ol_d_id, ol_o_id) ol_c " +
-	    "    ON o.o_w_id = ol_c.ol_w_id " +
-	    "   AND o.o_d_id = ol_c.ol_d_id " +
-	    "   AND o.o_id   = ol_c.ol_o_id " +
-	    " WHERE o.o_ol_cnt <> COALESCE(ol_c.cnt, 0) " +
-	    " LIMIT 1";
-	lastSql = sql;
-	Statement st = conn.createStatement();
-	try
-	{
-	    ResultSet rs = st.executeQuery(sql);
-	    if (rs.next())
-	    {
-		String key = "w_id=" + rs.getInt(1) +
-			     ", d_id=" + rs.getInt(2) +
-			     ", o_id=" + rs.getInt(3);
-		String detail = "o_ol_cnt=" + rs.getInt(4) +
-				", count(ol)=" + rs.getInt(5);
-		return new CheckResult(false, key, detail);
-	    }
-	    return new CheckResult(true, "", "");
-	}
-	finally
-	{
-	    try { st.close(); } catch (SQLException e) { /* ignore */ }
-	}
-    }
-
-    /*
-     * Clause 3.3.2.7: for each order line,
-     *     OL_DELIVERY_D IS NULL  iff  O_CARRIER_ID IS NULL
-     * on the parent order.
-     */
-    private CheckResult checkCondition7() throws SQLException
-    {
-	String sql =
-	    "SELECT ol.ol_w_id, ol.ol_d_id, ol.ol_o_id, ol.ol_number, " +
-	    "       CASE WHEN ol.ol_delivery_d IS NULL THEN 1 ELSE 0 END AS ol_null, " +
-	    "       CASE WHEN o.o_carrier_id IS NULL THEN 1 ELSE 0 END AS carrier_null " +
-	    "  FROM bmsql_order_line ol " +
-	    "  JOIN bmsql_oorder o " +
-	    "    ON ol.ol_w_id = o.o_w_id " +
-	    "   AND ol.ol_d_id = o.o_d_id " +
-	    "   AND ol.ol_o_id = o.o_id " +
-	    " WHERE (ol.ol_delivery_d IS NULL) <> (o.o_carrier_id IS NULL) " +
-	    " LIMIT 1";
-	lastSql = sql;
-	Statement st = conn.createStatement();
-	try
-	{
-	    ResultSet rs = st.executeQuery(sql);
-	    if (rs.next())
-	    {
-		String key = "w_id=" + rs.getInt(1) +
-			     ", d_id=" + rs.getInt(2) +
-			     ", o_id=" + rs.getInt(3) +
-			     ", ol_number=" + rs.getInt(4);
-		String detail = "ol_delivery_d_null=" + rs.getInt(5) +
-				", o_carrier_id_null=" + rs.getInt(6);
-		return new CheckResult(false, key, detail);
-	    }
-	    return new CheckResult(true, "", "");
-	}
-	finally
-	{
-	    try { st.close(); } catch (SQLException e) { /* ignore */ }
-	}
-    }
-
-    /*
-     * Clause 3.3.2.8: for each warehouse,
-     *     W_YTD = sum(H_AMOUNT) over HISTORY rows with H_W_ID = W_ID.
-     *
-     * Full scan of HISTORY — expensive on long runs.
-     */
-    private CheckResult checkCondition8() throws SQLException
-    {
-	String sql =
-	    "SELECT w.w_id, w.w_ytd, h.sum_h_amount " +
-	    "  FROM bmsql_warehouse w " +
-	    "  JOIN (SELECT h_w_id, SUM(h_amount) AS sum_h_amount " +
-	    "          FROM bmsql_history " +
-	    "         GROUP BY h_w_id) h " +
-	    "    ON w.w_id = h.h_w_id " +
-	    " WHERE w.w_ytd <> h.sum_h_amount " +
-	    " LIMIT 1";
-	lastSql = sql;
-	Statement st = conn.createStatement();
-	try
-	{
-	    ResultSet rs = st.executeQuery(sql);
-	    if (rs.next())
-	    {
-		String key = "w_id=" + rs.getInt(1);
-		String detail = "w_ytd=" + rs.getBigDecimal(2) +
-				", sum(h_amount)=" + rs.getBigDecimal(3);
-		return new CheckResult(false, key, detail);
-	    }
-	    return new CheckResult(true, "", "");
-	}
-	finally
-	{
-	    try { st.close(); } catch (SQLException e) { /* ignore */ }
-	}
-    }
-
-    /*
-     * Clause 3.3.2.9: for each district,
-     *     D_YTD = sum(H_AMOUNT) over HISTORY rows with
-     *     (H_W_ID, H_D_ID) = (D_W_ID, D_ID).
-     */
-    private CheckResult checkCondition9() throws SQLException
-    {
-	String sql =
-	    "SELECT d.d_w_id, d.d_id, d.d_ytd, h.sum_h_amount " +
-	    "  FROM bmsql_district d " +
-	    "  JOIN (SELECT h_w_id, h_d_id, SUM(h_amount) AS sum_h_amount " +
-	    "          FROM bmsql_history " +
-	    "         GROUP BY h_w_id, h_d_id) h " +
-	    "    ON d.d_w_id = h.h_w_id AND d.d_id = h.h_d_id " +
-	    " WHERE d.d_ytd <> h.sum_h_amount " +
-	    " LIMIT 1";
-	lastSql = sql;
-	Statement st = conn.createStatement();
-	try
-	{
-	    ResultSet rs = st.executeQuery(sql);
-	    if (rs.next())
-	    {
-		String key = "d_w_id=" + rs.getInt(1) +
-			     ", d_id=" + rs.getInt(2);
-		String detail = "d_ytd=" + rs.getBigDecimal(3) +
-				", sum(h_amount)=" + rs.getBigDecimal(4);
-		return new CheckResult(false, key, detail);
-	    }
-	    return new CheckResult(true, "", "");
-	}
-	finally
-	{
-	    try { st.close(); } catch (SQLException e) { /* ignore */ }
-	}
-    }
-
-    /*
-     * Clause 3.3.2.10: for each customer,
-     *     C_BALANCE = sum(OL_AMOUNT) for delivered order lines of the
-     *                 customer   -   sum(H_AMOUNT) for payments of the
-     *                                customer.
-     *
-     * OL_AMOUNT aggregation must join ORDER_LINE to OORDER to recover
-     * the O_C_ID — order lines don't carry the customer id directly.
-     * HISTORY rows identify the paying customer via H_C_W_ID /
-     * H_C_D_ID / H_C_ID. Customers with no delivered lines and no
-     * history rows are handled with COALESCE(..., 0).
-     *
-     * Most expensive check in v1 (two full aggregates joined against
-     * CUSTOMER).
-     */
-    private CheckResult checkCondition10() throws SQLException
-    {
-	String sql =
-	    "SELECT c.c_w_id, c.c_d_id, c.c_id, c.c_balance, " +
-	    "       COALESCE(ol_agg.sum_ol, 0) AS sum_delivered, " +
-	    "       COALESCE(h_agg.sum_h,  0) AS sum_paid " +
-	    "  FROM bmsql_customer c " +
-	    "  LEFT JOIN (SELECT o.o_w_id, o.o_d_id, o.o_c_id, " +
-	    "                    SUM(ol.ol_amount) AS sum_ol " +
-	    "               FROM bmsql_order_line ol " +
-	    "               JOIN bmsql_oorder o " +
-	    "                 ON ol.ol_w_id = o.o_w_id " +
-	    "                AND ol.ol_d_id = o.o_d_id " +
-	    "                AND ol.ol_o_id = o.o_id " +
-	    "              WHERE ol.ol_delivery_d IS NOT NULL " +
-	    "              GROUP BY o.o_w_id, o.o_d_id, o.o_c_id) ol_agg " +
-	    "    ON c.c_w_id = ol_agg.o_w_id " +
-	    "   AND c.c_d_id = ol_agg.o_d_id " +
-	    "   AND c.c_id   = ol_agg.o_c_id " +
-	    "  LEFT JOIN (SELECT h_c_w_id, h_c_d_id, h_c_id, " +
-	    "                    SUM(h_amount) AS sum_h " +
-	    "               FROM bmsql_history " +
-	    "              GROUP BY h_c_w_id, h_c_d_id, h_c_id) h_agg " +
-	    "    ON c.c_w_id = h_agg.h_c_w_id " +
-	    "   AND c.c_d_id = h_agg.h_c_d_id " +
-	    "   AND c.c_id   = h_agg.h_c_id " +
-	    " WHERE c.c_balance <> " +
-	    "       (COALESCE(ol_agg.sum_ol, 0) - COALESCE(h_agg.sum_h, 0)) " +
-	    " LIMIT 1";
-	lastSql = sql;
-	Statement st = conn.createStatement();
-	try
-	{
-	    ResultSet rs = st.executeQuery(sql);
-	    if (rs.next())
-	    {
-		String key = "w_id=" + rs.getInt(1) +
-			     ", d_id=" + rs.getInt(2) +
-			     ", c_id=" + rs.getInt(3);
-		String detail = "c_balance=" + rs.getBigDecimal(4) +
-				", sum(delivered ol_amount)=" + rs.getBigDecimal(5) +
-				", sum(h_amount)=" + rs.getBigDecimal(6);
-		return new CheckResult(false, key, detail);
-	    }
-	    return new CheckResult(true, "", "");
-	}
-	finally
-	{
-	    try { st.close(); } catch (SQLException e) { /* ignore */ }
-	}
-    }
-
-    private static boolean isImplemented(int conditionID)
-    {
-	return conditionID >= 1 && conditionID <= 10;
+	return sb.toString();
     }
 
     private void writeCsvRow(int checkID, long tsMs, int conditionID,
@@ -704,8 +342,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	{
 	    csv.write(runID + "," + checkID + "," + tsMs + "," +
 		      conditionID + "," + (r.passed ? 1 : 0) + "," +
-		      durationMs + "," + csvEscape(r.firstOffendingKey) +
-		      "," + csvEscape(r.detail) + "\n");
+		      durationMs + "," + csvEscape(r.detail) + "\n");
 	    csv.flush();
 	}
 	catch (IOException e)
@@ -745,13 +382,16 @@ public class jTPCCConsistencyCheck implements Runnable
 	return v;
     }
 
+    // Returns an empty list to mean "all conditions the SQL file supplies"
+    // (the checker expands once it has loaded the file). Non-empty input
+    // is parsed as an explicit list; upper-bound validation happens at
+    // expansion time since the max depends on the SQL file contents.
     public static List<Integer> parseConditions(String s)
     {
 	List<Integer> out = new ArrayList<Integer>();
 	if (s == null || s.trim().isEmpty() ||
 	    s.trim().equalsIgnoreCase("all"))
 	{
-	    for (int id : ALL_CONDITIONS) out.add(id);
 	    return out;
 	}
 	for (String part : s.split(","))
@@ -764,14 +404,14 @@ public class jTPCCConsistencyCheck implements Runnable
 		throw new IllegalArgumentException(
 		    "consistencyCheckConditions: not an integer: " + part);
 	    }
-	    if (id < 1 || id > 10)
+	    if (id < 1)
 		throw new IllegalArgumentException(
-		    "consistencyCheckConditions: id out of range 1..10: " + id);
+		    "consistencyCheckConditions: id must be >= 1: " + id);
 	    out.add(id);
 	}
 	if (out.isEmpty())
 	    throw new IllegalArgumentException(
-		"consistencyCheckConditions: empty");
+		"consistencyCheckConditions: parsed to empty list");
 	return out;
     }
 
@@ -802,12 +442,10 @@ public class jTPCCConsistencyCheck implements Runnable
     private static class CheckResult
     {
 	final boolean passed;
-	final String  firstOffendingKey;
 	final String  detail;
-	CheckResult(boolean passed, String firstOffendingKey, String detail)
+	CheckResult(boolean passed, String detail)
 	{
 	    this.passed = passed;
-	    this.firstOffendingKey = firstOffendingKey;
 	    this.detail = detail;
 	}
     }
