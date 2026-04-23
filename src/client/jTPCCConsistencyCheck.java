@@ -37,6 +37,9 @@ public class jTPCCConsistencyCheck implements Runnable
     private volatile boolean        requestStop = false;
     private int                     checkCounter = 0;
     private final Set<Integer>      warnedUnimplemented = new HashSet<Integer>();
+    // Last SQL issued by a check, so runOneCycle can log it on violation
+    // or SQLException. The checker is single-threaded, so no sync needed.
+    private String                  lastSql = null;
 
     // Cumulative stats, published for the end-of-run summary.
     private volatile int            totalPassed  = 0;
@@ -168,7 +171,8 @@ public class jTPCCConsistencyCheck implements Runnable
 		r = new CheckResult(false, "",
 				    "SQLException: " + e.getMessage());
 		log.error("Term-CC, condition " + conditionID +
-			  " errored: " + e.getMessage());
+			  " errored: " + e.getMessage() +
+			  "\n  SQL: " + lastSql);
 	    }
 	    long durationMs = (System.nanoTime() - startNs) / 1_000_000L;
 
@@ -190,7 +194,8 @@ public class jTPCCConsistencyCheck implements Runnable
 			", detail=" + r.detail;
 		log.error("Term-CC, condition " + conditionID +
 			  " FAILED: key=" + r.firstOffendingKey +
-			  " detail=" + r.detail);
+			  " detail=" + r.detail +
+			  "\n  SQL: " + lastSql);
 		if (abortOnFail)
 		    break;
 	    }
@@ -258,6 +263,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	    "    ON w.w_id = d.d_w_id " +
 	    " WHERE w.w_ytd <> d.sum_d_ytd " +
 	    " LIMIT 1";
+	lastSql = sql;
 	Statement st = conn.createStatement();
 	try
 	{
@@ -305,6 +311,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	    "    OR (no_agg.max_no_o_id IS NOT NULL " +
 	    "        AND (d.d_next_o_id - 1) <> no_agg.max_no_o_id) " +
 	    " LIMIT 1";
+	lastSql = sql;
 	Statement st = conn.createStatement();
 	try
 	{
@@ -350,6 +357,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	    " GROUP BY no_w_id, no_d_id " +
 	    "HAVING MAX(no_o_id) - MIN(no_o_id) + 1 <> COUNT(*) " +
 	    " LIMIT 1";
+	lastSql = sql;
 	Statement st = conn.createStatement();
 	try
 	{
@@ -393,6 +401,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	    "    ON a.w_id = b.w_id AND a.d_id = b.d_id " +
 	    " WHERE a.sum_ol_cnt <> b.count_ol " +
 	    " LIMIT 1";
+	lastSql = sql;
 	Statement st = conn.createStatement();
 	try
 	{
@@ -433,6 +442,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	    "   AND o.o_id   = no.no_o_id " +
 	    " WHERE (o.o_carrier_id IS NULL) <> (no.no_o_id IS NOT NULL) " +
 	    " LIMIT 1";
+	lastSql = sql;
 	Statement st = conn.createStatement();
 	try
 	{
@@ -478,6 +488,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	    "   AND o.o_id   = ol_c.ol_o_id " +
 	    " WHERE o.o_ol_cnt <> COALESCE(ol_c.cnt, 0) " +
 	    " LIMIT 1";
+	lastSql = sql;
 	Statement st = conn.createStatement();
 	try
 	{
@@ -517,6 +528,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	    "   AND ol.ol_o_id = o.o_id " +
 	    " WHERE (ol.ol_delivery_d IS NULL) <> (o.o_carrier_id IS NULL) " +
 	    " LIMIT 1";
+	lastSql = sql;
 	Statement st = conn.createStatement();
 	try
 	{
@@ -556,6 +568,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	    "    ON w.w_id = h.h_w_id " +
 	    " WHERE w.w_ytd <> h.sum_h_amount " +
 	    " LIMIT 1";
+	lastSql = sql;
 	Statement st = conn.createStatement();
 	try
 	{
@@ -591,6 +604,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	    "    ON d.d_w_id = h.h_w_id AND d.d_id = h.h_d_id " +
 	    " WHERE d.d_ytd <> h.sum_h_amount " +
 	    " LIMIT 1";
+	lastSql = sql;
 	Statement st = conn.createStatement();
 	try
 	{
@@ -655,6 +669,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	    " WHERE c.c_balance <> " +
 	    "       (COALESCE(ol_agg.sum_ol, 0) - COALESCE(h_agg.sum_h, 0)) " +
 	    " LIMIT 1";
+	lastSql = sql;
 	Statement st = conn.createStatement();
 	try
 	{
