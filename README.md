@@ -4,6 +4,24 @@ BENCHMARKSQL README
 CHANGE LOG:
 -----------
 
+Version 6.0 TBD chee.wooson:
+----------------------------
+  +  Upgrade to PostgreSQL 42.2.28.jre7 JDBC driver. The previous
+     9.3-1102 driver did not map the JDBC constant
+     TRANSACTION_REPEATABLE_READ to a SQL isolation level, which
+     blocked snapshot-mode consistency checking below.
+  +  Add a long-stability consistency-check mode. When
+     consistencyCheck=true is set in the properties file, a
+     dedicated read-only thread evaluates 10 TPC-C Clause 3.3
+     consistency conditions against the live database each cycle,
+     inside its own REPEATABLE READ (or SERIALIZABLE) transaction.
+     Per-cycle results are written to
+     <resultDirectory>/data/consistency.csv, and a summary block is
+     included in the end-of-run report. If any condition fails and
+     consistencyCheckAbortOnFail=true (default), the run is
+     terminated. PostgreSQL only in this version. See the
+     consistencyCheck* keys in run/props.pg for configuration.
+
 Version 5.0 lussman & jannicash:
 --------------------------------------
   +  Upgrade to PostgreSQL 9.3 JDBC 4.1 version 1102 driver
