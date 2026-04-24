@@ -1,6 +1,6 @@
 -- TPC-C Clause 3.3 consistency check queries, one per condition,
 -- in condition-ID order (1st statement = condition 1, etc.).
--- Parsed by jTPCCConsistencyCheck using the same ;-split convention
+-- Parsed by jTPCCConsistencyCheck using the same semicolon-split convention
 -- as the other sql.common scripts (\; is the literal-semicolon escape,
 -- not needed by any current query).
 
