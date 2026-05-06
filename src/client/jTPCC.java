@@ -46,8 +46,10 @@ public class jTPCC implements jTPCCConfig
     private double tpmC;
     private jTPCCRandom rnd;
     private OSCollector osCollector = null;
-    private jTPCCConsistencyCheck consistencyCheck = null;
-    private Thread                consistencyCheckThread = null;
+    private jTPCCConsistencyCheck consistencyCheckPri = null;
+    private Thread                consistencyCheckPriThread = null;
+    private jTPCCConsistencyCheck consistencyCheckStby = null;
+    private Thread                consistencyCheckStbyThread = null;
 
     public static void main(String args[])
     {
@@ -120,6 +122,9 @@ public class jTPCC implements jTPCCConfig
 	String  iCCConditions       = null;
 	String  iCCIsolation        = null;
 	String  iCCAbortOnFail      = null;
+	String  iCCStandbyConn      = null;
+	String  iCCStandbyUser      = null;
+	String  iCCStandbyPassword  = null;
 	if (iConsistencyCheck != null && iConsistencyCheck.equalsIgnoreCase("true"))
 	{
 	    log.info("Term-00, consistencyCheck=" + iConsistencyCheck);
@@ -127,6 +132,19 @@ public class jTPCC implements jTPCCConfig
 	    iCCConditions   = getProp(ini, "consistencyCheckConditions");
 	    iCCIsolation    = getProp(ini, "consistencyCheckIsolation");
 	    iCCAbortOnFail  = getProp(ini, "consistencyCheckAbortOnFail");
+	    // Optional: also run an independent checker against a hot
+	    // standby. Same interval / conditions / isolation as the
+	    // primary checker — running them in lockstep is the point.
+	    iCCStandbyConn     = ini.getProperty("consistencyCheckStandbyConn");
+	    iCCStandbyUser     = ini.getProperty("consistencyCheckStandbyUser");
+	    iCCStandbyPassword = ini.getProperty("consistencyCheckStandbyPassword");
+	    if (iCCStandbyConn != null && !iCCStandbyConn.trim().isEmpty())
+	    {
+		log.info("Term-00, consistencyCheckStandbyConn=" + iCCStandbyConn);
+		if (iCCStandbyUser != null)
+		    log.info("Term-00, consistencyCheckStandbyUser=" + iCCStandbyUser);
+		// Password is never logged.
+	    }
 	}
 
 	log.info("Term-00, ");
@@ -597,17 +615,49 @@ public class jTPCC implements jTPCCConfig
 			}
 
 			try {
-			    consistencyCheck = new jTPCCConsistencyCheck(
-				this, iConn, dbProps,
+			    consistencyCheckPri = new jTPCCConsistencyCheck(
+				this, jTPCCConsistencyCheck.ROLE_PRIMARY,
+				iConn, dbProps,
 				ccInterval, ccConditions, ccIsolation, ccAbort,
 				runID, resultDataDir, iDB);
-			    consistencyCheckThread =
-				new Thread(consistencyCheck, "ConsistencyCheck");
-			    consistencyCheckThread.start();
+			    consistencyCheckPriThread =
+				new Thread(consistencyCheckPri,
+					   "ConsistencyCheck-pri");
+			    consistencyCheckPriThread.start();
 			} catch (IOException ioe) {
 			    errorMessage("Failed to start consistency checker: " +
 					 ioe.getMessage());
 			    throw new Exception();
+			}
+
+			// Optional standby checker. user/password fall back to
+			// the workload's credentials when the standby variants
+			// are not set, since most replication setups expose
+			// the same role on both servers.
+			if (iCCStandbyConn != null &&
+			    !iCCStandbyConn.trim().isEmpty())
+			{
+			    Properties standbyProps = new Properties();
+			    standbyProps.setProperty("user",
+				(iCCStandbyUser != null) ? iCCStandbyUser : iUser);
+			    standbyProps.setProperty("password",
+				(iCCStandbyPassword != null) ? iCCStandbyPassword : iPassword);
+
+			    try {
+				consistencyCheckStby = new jTPCCConsistencyCheck(
+				    this, jTPCCConsistencyCheck.ROLE_STANDBY,
+				    iCCStandbyConn, standbyProps,
+				    ccInterval, ccConditions, ccIsolation, ccAbort,
+				    runID, resultDataDir, iDB);
+				consistencyCheckStbyThread =
+				    new Thread(consistencyCheckStby,
+					       "ConsistencyCheck-stby");
+				consistencyCheckStbyThread.start();
+			    } catch (IOException ioe) {
+				errorMessage("Failed to start standby consistency checker: " +
+					     ioe.getMessage());
+				throw new Exception();
+			    }
 			}
 		    }
 		}
@@ -629,9 +679,9 @@ public class jTPCC implements jTPCCConfig
 	updateStatusLine();
     }
 
-    public void signalConsistencyCheckFailure(String reason)
+    public void signalConsistencyCheckFailure(String role, String reason)
     {
-	errorMessage("Consistency check failed: " + reason);
+	errorMessage("Consistency check failed [" + role + "]: " + reason);
 	signalTerminalsRequestEnd(false);
     }
 
@@ -680,23 +730,32 @@ public class jTPCC implements jTPCCConfig
 	    sessionEndTargetTime = -1;
 	    printMessage("All terminals finished executing " + sessionEnd);
 
-	    // Stop the consistency checker before the end-of-run report so
-	    // its cumulative stats (including the final cycle) can be folded
-	    // into the summary.
-	    if (consistencyCheck != null)
+	    // Stop both consistency checkers before the end-of-run report
+	    // so their cumulative stats (including the final cycle) can be
+	    // folded into the summary. Signal both first, then join, so the
+	    // last cycles run in parallel.
+	    if (consistencyCheckPri != null)
+		consistencyCheckPri.requestStop();
+	    if (consistencyCheckStby != null)
+		consistencyCheckStby.requestStop();
+	    if (consistencyCheckPriThread != null)
 	    {
-		consistencyCheck.requestStop();
-		if (consistencyCheckThread != null)
-		{
-		    try { consistencyCheckThread.join(); }
-		    catch (InterruptedException ie)
-		    { Thread.currentThread().interrupt(); }
-		}
+		try { consistencyCheckPriThread.join(); }
+		catch (InterruptedException ie)
+		{ Thread.currentThread().interrupt(); }
+	    }
+	    if (consistencyCheckStbyThread != null)
+	    {
+		try { consistencyCheckStbyThread.join(); }
+		catch (InterruptedException ie)
+		{ Thread.currentThread().interrupt(); }
 	    }
 
 	    endReport();
-	    consistencyCheck = null;
-	    consistencyCheckThread = null;
+	    consistencyCheckPri = null;
+	    consistencyCheckPriThread = null;
+	    consistencyCheckStby = null;
+	    consistencyCheckStbyThread = null;
 	    terminalsBlockingExit = false;
 	    printMessage("Session finished!");
 
@@ -774,20 +833,23 @@ public class jTPCC implements jTPCCConfig
 	log.info("Term-00, Session End       = " + sessionEnd);
 	log.info("Term-00, Transaction Count = " + (transactionCount-1));
 
-	if (consistencyCheck != null)
-	{
-	    log.info("Term-00, ");
-	    log.info("Term-00, Consistency Check Summary");
-	    log.info("Term-00,   Cycles run       = " +
-		     consistencyCheck.getTotalCycles());
-	    log.info("Term-00,   Conditions passed= " +
-		     consistencyCheck.getTotalPassed());
-	    log.info("Term-00,   Conditions failed= " +
-		     consistencyCheck.getTotalFailed());
-	    String firstFail = consistencyCheck.getFirstFailureSummary();
-	    if (firstFail != null)
-		log.info("Term-00,   First failure    = " + firstFail);
-	}
+	if (consistencyCheckPri != null)
+	    logConsistencyCheckSummary(consistencyCheckPri);
+	if (consistencyCheckStby != null)
+	    logConsistencyCheckSummary(consistencyCheckStby);
+    }
+
+    private void logConsistencyCheckSummary(jTPCCConsistencyCheck cc)
+    {
+	log.info("Term-00, ");
+	log.info("Term-00, Consistency Check Summary [" + cc.getRole() + "]");
+	log.info("Term-00,   Cycles run        = " + cc.getTotalCycles());
+	log.info("Term-00,   Conditions passed = " + cc.getTotalPassed());
+	log.info("Term-00,   Conditions failed = " + cc.getTotalFailed());
+	log.info("Term-00,   Conditions skipped= " + cc.getTotalSkipped());
+	String firstFail = cc.getFirstFailureSummary();
+	if (firstFail != null)
+	    log.info("Term-00,   First failure     = " + firstFail);
     }
 
     private void printMessage(String message)

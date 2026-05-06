@@ -21,6 +21,18 @@ Version 6.0 TBD chee.wooson:
      consistencyCheckAbortOnFail=true (default), the run is
      terminated. PostgreSQL only in this version. See the
      consistencyCheck* keys in run/props.pg for configuration.
+  +  Optional parallel primary+standby consistency checking. When
+     consistencyCheckStandbyConn is set, a second checker runs the
+     same conditions against a hot standby in lockstep with the
+     primary. Standby results land in
+     <resultDirectory>/data/consistency_standby.csv and the end-of-run
+     report prints a separate summary per role. The diagnostic intent
+     is to separate workload-logic bugs (which fail on both sides)
+     from WAL replay or snapshot-visibility bugs on the replica
+     (which pass on the primary but fail on the standby). PostgreSQL
+     hot-standby recovery conflicts (max_standby_streaming_delay
+     query cancellation) are downgraded to WARN, do not count as
+     consistency failures, and do not trip abortOnFail.
 
 Version 5.0 lussman & jannicash:
 --------------------------------------

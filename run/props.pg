@@ -50,10 +50,36 @@ osCollectorDevices=net_eth0 blk_sda
 // consistencyCheckConditions   "all" or comma-separated condition IDs
 //                              from Clause 3.3 (1..12)
 // consistencyCheckIsolation    REPEATABLE_READ | SERIALIZABLE
-// consistencyCheckAbortOnFail  true = stop the run on first violation
+//                              (on a hot standby PG treats SERIALIZABLE
+//                              as REPEATABLE_READ — no full SSI)
+// consistencyCheckAbortOnFail  true = stop the run on first violation,
+//                              from either the primary or the standby
+//                              checker
+//
+// Optional: also run an independent checker against a hot standby in
+// parallel. Same interval/conditions/isolation/abortOnFail as the
+// primary — running in lockstep is the point: a condition failing on
+// both sides points at workload/transaction logic, while passing on
+// the primary but failing on the standby points at WAL replay or
+// snapshot visibility on the replica. Results are written to a
+// separate file (consistency_standby.csv) for after-the-fact diff.
+//
+// On a hot standby long checker queries can be cancelled with
+// "ERROR: canceling statement due to conflict with recovery". Either
+// raise max_standby_streaming_delay on the standby or set
+// hot_standby_feedback=on on the standby (the latter trades vacuum
+// progress on the primary for query stability on the standby).
+//
+// consistencyCheckStandbyConn       JDBC URL of the hot standby; unset
+//                                   = primary-only (default)
+// consistencyCheckStandbyUser       defaults to `user`
+// consistencyCheckStandbyPassword   defaults to `password`
 // ----
 //consistencyCheck=true
 //consistencyCheckIntervalSec=60
 //consistencyCheckConditions=all
 //consistencyCheckIsolation=REPEATABLE_READ
 //consistencyCheckAbortOnFail=true
+//consistencyCheckStandbyConn=jdbc:postgresql://standby-host:5432/postgres
+//consistencyCheckStandbyUser=benchmarksql
+//consistencyCheckStandbyPassword=PWbmsql

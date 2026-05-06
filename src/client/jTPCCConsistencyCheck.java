@@ -12,8 +12,15 @@
  * The file is ;-separated. The Nth statement is condition N. Each
  * query must return zero rows when the condition holds; any returned
  * row is a violation, and the row's columns are logged and written to
- * consistency.csv. Use LIMIT 1 / FETCH FIRST 1 to keep the payload
+ * a per-role CSV. Use LIMIT 1 / FETCH FIRST 1 to keep the payload
  * small.
+ *
+ * One instance targets one server. The role label ("primary" or
+ * "standby") drives the log prefix, the CSV filename, and the failure
+ * signal back to jTPCC, so a parallel primary+standby pair can be told
+ * apart at a glance: same condition failing on both = workload-logic
+ * bug, passing on primary but failing on standby = redo / replication
+ * bug.
  */
 
 import org.apache.log4j.*;
@@ -26,7 +33,12 @@ public class jTPCCConsistencyCheck implements Runnable
 {
     private static Logger log = Logger.getLogger(jTPCCConsistencyCheck.class);
 
+    public  static final String     ROLE_PRIMARY = "primary";
+    public  static final String     ROLE_STANDBY = "standby";
+
     private final jTPCC             parent;
+    private final String            role;       // "primary" or "standby"
+    private final String            logPrefix;  // "Term-CC-pri" / "Term-CC-stby"
     private final String            dbUrl;
     private final Properties        dbProps;
     private final int               intervalSec;
@@ -47,17 +59,25 @@ public class jTPCCConsistencyCheck implements Runnable
     // Cumulative stats, published for the end-of-run summary.
     private volatile int            totalPassed  = 0;
     private volatile int            totalFailed  = 0;
+    private volatile int            totalSkipped = 0;
     private volatile String         firstFailureSummary = null;
 
     public jTPCCConsistencyCheck(
-            jTPCC parent,
+            jTPCC parent, String role,
             String dbUrl, Properties dbProps,
             int intervalSec, List<Integer> conditions,
             int isolationLevel, boolean abortOnFail,
             int runID, File resultDataDir,
             String dbType) throws IOException
     {
+	if (!ROLE_PRIMARY.equals(role) && !ROLE_STANDBY.equals(role))
+	    throw new IllegalArgumentException(
+		"consistency check role must be \"" + ROLE_PRIMARY +
+		"\" or \"" + ROLE_STANDBY + "\", got " + role);
+
 	this.parent = parent;
+	this.role = role;
+	this.logPrefix = ROLE_PRIMARY.equals(role) ? "Term-CC-pri" : "Term-CC-stby";
 	this.dbUrl = dbUrl;
 	this.dbProps = dbProps;
 	this.intervalSec = intervalSec;
@@ -65,7 +85,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	this.abortOnFail = abortOnFail;
 	this.runID = runID;
 
-	this.sqls = loadSqlFile(dbType);
+	this.sqls = loadSqlFile(dbType, this.logPrefix);
 
 	// Expand "all" (empty list from parseConditions) to every condition
 	// the file supplies, or validate the explicit list against the
@@ -90,17 +110,23 @@ public class jTPCCConsistencyCheck implements Runnable
 	    this.conditions = conditions;
 	}
 
-	File f = new File(resultDataDir, "consistency.csv");
+	// Primary keeps the historical filename consistency.csv; standby
+	// gets a suffixed filename so a primary+standby run produces two
+	// independent files for after-the-fact comparison.
+	String csvName = ROLE_PRIMARY.equals(role)
+			 ? "consistency.csv" : "consistency_standby.csv";
+	File f = new File(resultDataDir, csvName);
 	this.csv = new BufferedWriter(new FileWriter(f));
 	csv.write("run,checkID,tsMs,conditionID,passed,durationMs,detail\n");
 	csv.flush();
-	log.info("Term-CC, writing consistency results to " + f.getPath());
+	log.info(logPrefix + ", writing consistency results to " + f.getPath());
     }
 
     // Resolve sql.<db>/consistencyCheck.sql first, then sql.common/, and
     // split the content on ';' (with \; as literal-semicolon escape) to
     // get one SQL per condition in declaration order.
-    private static List<String> loadSqlFile(String dbType) throws IOException
+    private static List<String> loadSqlFile(String dbType, String logPrefix)
+	throws IOException
     {
 	String name = "consistencyCheck.sql";
 	File vendor = new File("sql." + dbType, name);
@@ -150,7 +176,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	if (out.isEmpty())
 	    throw new IOException("consistency SQL file " +
 				  target.getPath() + " contains no statements");
-	log.info("Term-CC, loaded " + out.size() +
+	log.info(logPrefix + ", loaded " + out.size() +
 		 " consistency SQL statement(s) from " + target.getPath());
 	return out;
     }
@@ -160,9 +186,11 @@ public class jTPCCConsistencyCheck implements Runnable
 	requestStop = true;
     }
 
+    public String getRole()            { return role; }
     public int getTotalCycles()        { return checkCounter; }
     public int getTotalPassed()        { return totalPassed; }
     public int getTotalFailed()        { return totalFailed; }
+    public int getTotalSkipped()       { return totalSkipped; }
     public String getFirstFailureSummary() { return firstFailureSummary; }
 
     public void run()
@@ -176,17 +204,18 @@ public class jTPCCConsistencyCheck implements Runnable
 	}
 	catch (SQLException e)
 	{
-	    log.error("Term-CC, failed to open checker connection: " +
+	    log.error(logPrefix + ", failed to open checker connection: " +
 		      e.getMessage());
 	    closeCsv();
 	    // Silent degradation would turn consistencyCheck=true into a
 	    // no-op; treat startup failure the same as a violation.
-	    parent.signalConsistencyCheckFailure(
+	    parent.signalConsistencyCheckFailure(role,
 		"checker startup failed: " + e.getMessage());
 	    return;
 	}
 
-	log.info("Term-CC, started (interval=" + intervalSec + "s, " +
+	log.info(logPrefix + ", started (url=" + dbUrl +
+		 ", interval=" + intervalSec + "s, " +
 		 "conditions=" + conditions + ", isolation=" +
 		 isolationName(isolationLevel) + ", abortOnFail=" +
 		 abortOnFail + ")");
@@ -220,7 +249,7 @@ public class jTPCCConsistencyCheck implements Runnable
 
 	try { conn.close(); } catch (SQLException e) { /* ignore */ }
 	closeCsv();
-	log.info("Term-CC, stopped after " + checkCounter + " cycle(s)");
+	log.info(logPrefix + ", stopped after " + checkCounter + " cycle(s)");
     }
 
     // Returns true if this cycle triggered an abort-on-fail.
@@ -229,7 +258,8 @@ public class jTPCCConsistencyCheck implements Runnable
 	checkCounter++;
 	int localCheckID = checkCounter;
 	long cycleStartMs = System.currentTimeMillis();
-	int passed = 0, failed = 0;
+	int passed = 0, failed = 0, skipped = 0;
+	boolean cycleAbandoned = false;
 
 	for (int conditionID : conditions)
 	{
@@ -242,8 +272,26 @@ public class jTPCCConsistencyCheck implements Runnable
 	    }
 	    catch (SQLException e)
 	    {
+		// Hot-standby recovery conflicts (PG cancels the query
+		// when WAL replay can't be paused long enough) are not
+		// consistency violations — they're an artifact of running
+		// the checker on a replica. Roll back, mark the condition
+		// skipped, and abandon the rest of this cycle (subsequent
+		// queries on the aborted txn would all fail).
+		if (isRecoveryConflict(e))
+		{
+		    long durationMs = (System.nanoTime() - startNs) / 1_000_000L;
+		    skipped++;
+		    log.warn(logPrefix + ", condition " + conditionID +
+			     " skipped (standby recovery conflict, " +
+			     durationMs + "ms): " + e.getMessage());
+		    try { conn.rollback(); }
+		    catch (SQLException ee) { /* ignore */ }
+		    cycleAbandoned = true;
+		    break;
+		}
 		r = new CheckResult(false, "SQLException: " + e.getMessage());
-		log.error("Term-CC, condition " + conditionID +
+		log.error(logPrefix + ", condition " + conditionID +
 			  " errored: " + e.getMessage() +
 			  "\n  SQL: " + lastSql);
 	    }
@@ -254,7 +302,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	    if (r.passed)
 	    {
 		passed++;
-		log.debug("Term-CC, condition " + conditionID +
+		log.debug(logPrefix + ", condition " + conditionID +
 			  " passed in " + durationMs + "ms");
 	    }
 	    else
@@ -264,7 +312,7 @@ public class jTPCCConsistencyCheck implements Runnable
 		    firstFailureSummary =
 			"check #" + localCheckID + ", condition " +
 			conditionID + ", " + r.detail;
-		log.error("Term-CC, condition " + conditionID +
+		log.error(logPrefix + ", condition " + conditionID +
 			  " FAILED: " + r.detail +
 			  "\n  SQL: " + lastSql);
 		if (abortOnFail)
@@ -274,27 +322,42 @@ public class jTPCCConsistencyCheck implements Runnable
 
 	totalPassed += passed;
 	totalFailed += failed;
+	totalSkipped += skipped;
 
-	try { conn.commit(); }
-	catch (SQLException e)
+	if (!cycleAbandoned)
 	{
-	    log.error("Term-CC, commit failed: " + e.getMessage());
+	    try { conn.commit(); }
+	    catch (SQLException e)
+	    {
+		log.error(logPrefix + ", commit failed: " + e.getMessage());
+	    }
 	}
 
 	long cycleDurationMs = System.currentTimeMillis() - cycleStartMs;
-	log.info("Term-CC, check #" + localCheckID + ": " +
-		 passed + " passed, " + failed + " failed (" +
-		 cycleDurationMs + "ms)");
+	log.info(logPrefix + ", check #" + localCheckID + ": " +
+		 passed + " passed, " + failed + " failed" +
+		 (skipped > 0 ? ", " + skipped + " skipped" : "") +
+		 " (" + cycleDurationMs + "ms)");
 
 	if (failed > 0 && abortOnFail)
 	{
-	    log.error("Term-CC, abortOnFail=true, signalling run to stop");
-	    parent.signalConsistencyCheckFailure(
+	    log.error(logPrefix + ", abortOnFail=true, signalling run to stop");
+	    parent.signalConsistencyCheckFailure(role,
 		"consistency check #" + localCheckID + " had " +
 		failed + " failure(s)");
 	    return true;
 	}
 	return false;
+    }
+
+    // PG raises this exact text when max_standby_streaming_delay is hit
+    // on a hot standby. Match by message rather than SQLState since the
+    // state code (40001) is shared with other transient errors.
+    private static boolean isRecoveryConflict(SQLException e)
+    {
+	String m = e.getMessage();
+	return m != null &&
+	    m.contains("canceling statement due to conflict with recovery");
     }
 
     // Execute the SQL for the given condition. If the query returns any
@@ -347,8 +410,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	}
 	catch (IOException e)
 	{
-	    log.error("Term-CC, failed to write consistency.csv: " +
-		      e.getMessage());
+	    log.error(logPrefix + ", failed to write CSV: " + e.getMessage());
 	}
     }
 
