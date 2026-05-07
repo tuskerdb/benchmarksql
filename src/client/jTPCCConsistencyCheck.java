@@ -55,6 +55,7 @@ public class jTPCCConsistencyCheck implements Runnable
 
     private Connection              conn;
     private volatile boolean        requestStop = false;
+    private boolean                 connectionDead = false;
     private int                     checkCounter = 0;
     // Last SQL issued by a check, so runOneCycle can log it on violation
     // or SQLException. The checker is single-threaded, so no sync needed.
@@ -227,7 +228,7 @@ public class jTPCCConsistencyCheck implements Runnable
 	boolean stoppedDueToFailure = false;
 	long nextRunAt = System.currentTimeMillis();   // first cycle ASAP
 
-	while (!requestStop)
+	while (!requestStop && !connectionDead)
 	{
 	    long now = System.currentTimeMillis();
 	    if (now >= nextRunAt)
@@ -247,8 +248,9 @@ public class jTPCCConsistencyCheck implements Runnable
 	}
 
 	// Final check at shutdown, unless we're already winding down
-	// because of a detected violation.
-	if (!stoppedDueToFailure)
+	// because of a detected violation or a dead connection we
+	// couldn't reopen.
+	if (!stoppedDueToFailure && !connectionDead)
 	    runOneCycle();
 
 	try { conn.close(); } catch (SQLException e) { /* ignore */ }
@@ -275,12 +277,17 @@ public class jTPCCConsistencyCheck implements Runnable
 	    }
 	    catch (SQLException e)
 	    {
-		// Hot-standby recovery conflicts (PG cancels the query
-		// when WAL replay can't be paused long enough) are not
-		// consistency violations — they're an artifact of running
-		// the checker on a replica. Roll back this condition's
-		// transaction, mark it skipped, and continue with the
-		// next condition (each one is its own txn now).
+		// Hot-standby recovery conflicts are not consistency
+		// violations — they're an artifact of running the checker
+		// on a replica. PG raises one of two variants:
+		//   - "canceling statement ..."   — the query is killed
+		//     but the connection survives, so just rollback and
+		//     skip this condition.
+		//   - "terminating connection ..." — PG killed the whole
+		//     backend, so the JDBC conn is dead and every
+		//     subsequent query would error out. Reopen before
+		//     moving to the next condition; if reopen fails,
+		//     stop the checker (don't fail the run).
 		if (isRecoveryConflict(e))
 		{
 		    long durationMs = (System.nanoTime() - startNs) / 1_000_000L;
@@ -290,6 +297,11 @@ public class jTPCCConsistencyCheck implements Runnable
 			     durationMs + "ms): " + e.getMessage());
 		    try { conn.rollback(); }
 		    catch (SQLException ee) { /* ignore */ }
+		    if (isConnectionTerminated(e) && !reopenConnection())
+		    {
+			connectionDead = true;
+			break;
+		    }
 		    continue;
 		}
 		r = new CheckResult(false, "SQLException: " + e.getMessage());
@@ -359,14 +371,49 @@ public class jTPCCConsistencyCheck implements Runnable
 	return false;
     }
 
-    // PG raises this exact text when max_standby_streaming_delay is hit
-    // on a hot standby. Match by message rather than SQLState since the
-    // state code (40001) is shared with other transient errors.
+    // PG raises one of these texts when max_standby_streaming_delay
+    // (or _archive_delay) is hit on a hot standby. Match by message
+    // rather than SQLState since the state codes (40001 / 57P01) are
+    // shared with other transient errors.
+    //   - "canceling statement ..."   — query cancelled, conn lives
+    //   - "terminating connection ..." — whole backend killed
     private static boolean isRecoveryConflict(SQLException e)
     {
 	String m = e.getMessage();
+	if (m == null) return false;
+	return m.contains("canceling statement due to conflict with recovery")
+	    || m.contains("terminating connection due to conflict with recovery");
+    }
+
+    private static boolean isConnectionTerminated(SQLException e)
+    {
+	String m = e.getMessage();
 	return m != null &&
-	    m.contains("canceling statement due to conflict with recovery");
+	    m.contains("terminating connection due to conflict with recovery");
+    }
+
+    // Drop the (likely already-dead) JDBC connection and open a fresh
+    // one with the same read-only / isolation settings. Returns true
+    // on success.
+    private boolean reopenConnection()
+    {
+	try { conn.close(); } catch (SQLException e) { /* ignore */ }
+	try
+	{
+	    conn = DriverManager.getConnection(dbUrl, dbProps);
+	    conn.setAutoCommit(false);
+	    conn.setReadOnly(true);
+	    conn.setTransactionIsolation(isolationLevel);
+	    log.info(logPrefix + ", reopened checker connection after " +
+		     "standby recovery conflict");
+	    return true;
+	}
+	catch (SQLException e)
+	{
+	    log.error(logPrefix + ", failed to reopen checker connection: " +
+		      e.getMessage() + " — checker will stop");
+	    return false;
+	}
     }
 
     // Execute the SQL for the given condition. If the query returns any
