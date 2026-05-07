@@ -3,8 +3,12 @@
  *     consistency conditions, for long-stability testing.
  *
  * Runs in a dedicated thread with its own read-only JDBC connection.
- * Snapshot mode only: all configured conditions execute inside one
- * REPEATABLE READ / SERIALIZABLE transaction per cycle.
+ * Each condition executes in its own short read-only transaction.
+ * Earlier versions wrapped a whole cycle in one snapshot, but with all
+ * 12 conditions enabled that single transaction stayed open for many
+ * seconds and held back vacuum on the workload tables — splitting per
+ * condition trades cross-condition snapshot consistency for shorter
+ * per-transaction lifetime, which matters more in long-stability runs.
  *
  * The check queries live in a vendor-aware SQL file:
  *   sql.<db>/consistencyCheck.sql  (override, optional)
@@ -259,7 +263,6 @@ public class jTPCCConsistencyCheck implements Runnable
 	int localCheckID = checkCounter;
 	long cycleStartMs = System.currentTimeMillis();
 	int passed = 0, failed = 0, skipped = 0;
-	boolean cycleAbandoned = false;
 
 	for (int conditionID : conditions)
 	{
@@ -275,9 +278,9 @@ public class jTPCCConsistencyCheck implements Runnable
 		// Hot-standby recovery conflicts (PG cancels the query
 		// when WAL replay can't be paused long enough) are not
 		// consistency violations — they're an artifact of running
-		// the checker on a replica. Roll back, mark the condition
-		// skipped, and abandon the rest of this cycle (subsequent
-		// queries on the aborted txn would all fail).
+		// the checker on a replica. Roll back this condition's
+		// transaction, mark it skipped, and continue with the
+		// next condition (each one is its own txn now).
 		if (isRecoveryConflict(e))
 		{
 		    long durationMs = (System.nanoTime() - startNs) / 1_000_000L;
@@ -287,8 +290,7 @@ public class jTPCCConsistencyCheck implements Runnable
 			     durationMs + "ms): " + e.getMessage());
 		    try { conn.rollback(); }
 		    catch (SQLException ee) { /* ignore */ }
-		    cycleAbandoned = true;
-		    break;
+		    continue;
 		}
 		r = new CheckResult(false, "SQLException: " + e.getMessage());
 		log.error(logPrefix + ", condition " + conditionID +
@@ -296,6 +298,22 @@ public class jTPCCConsistencyCheck implements Runnable
 			  "\n  SQL: " + lastSql);
 	    }
 	    long durationMs = (System.nanoTime() - startNs) / 1_000_000L;
+
+	    // End the per-condition transaction. On a passed check we
+	    // commit; on a violation or non-recovery error the txn is
+	    // already poisoned (or we just want to release the snapshot
+	    // ASAP), so rollback is fine and avoids commit failures.
+	    try
+	    {
+		if (r.passed) conn.commit();
+		else          conn.rollback();
+	    }
+	    catch (SQLException e)
+	    {
+		log.error(logPrefix + ", end-of-condition " + conditionID +
+			  " " + (r.passed ? "commit" : "rollback") +
+			  " failed: " + e.getMessage());
+	    }
 
 	    writeCsvRow(localCheckID, tsMs, conditionID, r, durationMs);
 
@@ -323,15 +341,6 @@ public class jTPCCConsistencyCheck implements Runnable
 	totalPassed += passed;
 	totalFailed += failed;
 	totalSkipped += skipped;
-
-	if (!cycleAbandoned)
-	{
-	    try { conn.commit(); }
-	    catch (SQLException e)
-	    {
-		log.error(logPrefix + ", commit failed: " + e.getMessage());
-	    }
-	}
 
 	long cycleDurationMs = System.currentTimeMillis() - cycleStartMs;
 	log.info(logPrefix + ", check #" + localCheckID + ": " +

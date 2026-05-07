@@ -13,14 +13,15 @@ Version 6.0 TBD chee.wooson:
   +  Add a long-stability consistency-check mode. When
      consistencyCheck=true is set in the properties file, a
      dedicated read-only thread evaluates 10 TPC-C Clause 3.3
-     consistency conditions against the live database each cycle,
-     inside its own REPEATABLE READ (or SERIALIZABLE) transaction.
-     Per-cycle results are written to
-     <resultDirectory>/data/consistency.csv, and a summary block is
-     included in the end-of-run report. If any condition fails and
-     consistencyCheckAbortOnFail=true (default), the run is
-     terminated. PostgreSQL only in this version. See the
-     consistencyCheck* keys in run/props.pg for configuration.
+     consistency conditions against the live database each cycle.
+     Each condition runs in its own short REPEATABLE READ (or
+     SERIALIZABLE) transaction, so the checker does not hold a
+     long-lived snapshot across the full cycle. Per-cycle results
+     are written to <resultDirectory>/data/consistency.csv, and a
+     summary block is included in the end-of-run report. If any
+     condition fails and consistencyCheckAbortOnFail=true (default),
+     the run is terminated. PostgreSQL only in this version. See
+     the consistencyCheck* keys in run/props.pg for configuration.
   +  Optional parallel primary+standby consistency checking. When
      consistencyCheckStandbyConn is set, a second checker runs the
      same conditions against a hot standby in lockstep with the
